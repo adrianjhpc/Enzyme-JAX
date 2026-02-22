@@ -3142,7 +3142,8 @@ struct SliceTransposeBase final
   }
 };
 
-// slice(reduce_window x, last_idx) -> reduce x
+// 1. slice(reduce_window x, last_idx) -> reduce x
+// 2. slice(reduce_window x) -> reduce_window(slice x)
 struct SliceReduceWindow
     : public CheckedOpRewritePattern<stablehlo::SliceOp, SliceReduceWindow> {
   using CheckedOpRewritePattern<stablehlo::SliceOp,
@@ -3158,32 +3159,80 @@ struct SliceReduceWindow
     if (!llvm::hasSingleElement(reduceWindow->getUsers()))
       return failure();
 
+    if (reduceWindow.getInputs().size() != 1 ||
+        reduceWindow.getInitValues().size() != 1)
+      return failure();
+
     // Check window parameters indicate full reduction along one dimension
     auto windowDims = reduceWindow.getWindowDimensions();
     auto windowStrides = reduceWindow.getWindowStrides();
     auto windowDilations = reduceWindow.getWindowDilations();
     auto baseDilations = reduceWindow.getBaseDilations();
 
-    if (!reduceWindow.getPadding())
-      return failure();
-    auto padding = reduceWindow.getPadding()->getValues<int64_t>();
-
     // Check if the window strides are all 1 or unspecified
-    if (windowStrides && !llvm::all_of(*windowStrides, [](int64_t stride) {
+    bool stridesAllOne =
+        !windowStrides || llvm::all_of(*windowStrides, [](int64_t stride) {
           return stride == 1;
-        }))
-      return failure();
+        });
 
     // Check if the window dilations are all 1 or unspecified
-    if (windowDilations &&
-        !llvm::all_of(*windowDilations,
-                      [](int64_t dilation) { return dilation == 1; }))
-      return failure();
+    bool windowDilationsAllOne =
+        !windowDilations ||
+        llvm::all_of(*windowDilations,
+                     [](int64_t dilation) { return dilation == 1; });
 
     // Check if the base dilations are all 1 or unspecified
-    if (baseDilations && !llvm::all_of(*baseDilations, [](int64_t dilation) {
+    bool baseDilationsAllOne =
+        !baseDilations || llvm::all_of(*baseDilations, [](int64_t dilation) {
           return dilation == 1;
-        }))
+        });
+
+    auto padding = reduceWindow.getPadding();
+    bool zeroPadding =
+        !padding || llvm::all_of(padding->getValues<int64_t>(),
+                                 [](int64_t val) { return val == 0; });
+
+    auto sliceStarts = op.getStartIndices();
+    auto sliceLimits = op.getLimitIndices();
+    auto sliceStrides = op.getStrides();
+
+    bool sliceStridesAllOne =
+        sliceStrides.empty() ||
+        llvm::all_of(sliceStrides, [](int64_t stride) { return stride == 1; });
+
+    // Case 2: slice(reduce_window x) -> reduce_window(slice x)
+    if (stridesAllOne && windowDilationsAllOne && baseDilationsAllOne &&
+        zeroPadding && sliceStridesAllOne) {
+      int64_t rank = sliceStarts.size();
+      SmallVector<int64_t> newInputStarts(rank);
+      SmallVector<int64_t> newInputLimits(rank);
+      SmallVector<int64_t> newSliceStrides(rank, 1);
+
+      for (int64_t i = 0; i < rank; ++i) {
+        newInputStarts[i] = sliceStarts[i];
+        newInputLimits[i] = sliceLimits[i] + windowDims[i] - 1;
+      }
+
+      auto newSlice = stablehlo::SliceOp::create(
+          rewriter, op.getLoc(), reduceWindow.getInputs()[0], newInputStarts,
+          newInputLimits, newSliceStrides);
+
+      auto newRw = rewriter.replaceOpWithNewOp<stablehlo::ReduceWindowOp>(
+          op, op.getType(), ValueRange{newSlice.getResult()},
+          reduceWindow.getInitValues(), reduceWindow.getWindowDimensionsAttr(),
+          reduceWindow.getWindowStridesAttr(),
+          reduceWindow.getBaseDilationsAttr(),
+          reduceWindow.getWindowDilationsAttr(), reduceWindow.getPaddingAttr());
+
+      newRw.getBody().takeBody(reduceWindow.getBody());
+      return success();
+    }
+
+    if (!padding)
+      return failure();
+    auto paddingVals = padding->getValues<int64_t>();
+
+    if (!stridesAllOne || !windowDilationsAllOne || !baseDilationsAllOne)
       return failure();
 
     // Find which dimension has window size > 1 (the reduction dimension)
@@ -3208,17 +3257,13 @@ struct SliceReduceWindow
     // FIXME: do other padding values have to be 0?
     for (unsigned i = 0; i < windowDims.size(); ++i) {
       if (i == reductionDim) {
-        if (padding[2 * i] != windowDims[i] - 1)
+        if (paddingVals[2 * i] != windowDims[i] - 1)
           return failure();
       }
     }
 
     // Check this is a slice taking the last element in reduction dim
-    auto sliceStarts = op.getStartIndices();
-    auto sliceLimits = op.getLimitIndices();
-    auto sliceStrides = op.getStrides();
-
-    for (int64_t i = 0; i < sliceStarts.size(); ++i) {
+    for (int64_t i = 0; i < (int64_t)sliceStarts.size(); ++i) {
       if (!sliceStrides.empty() && sliceStrides[i] != 1)
         return failure();
 
@@ -14312,6 +14357,27 @@ struct ConjComplexNegate final
   }
 };
 
+// (neg (imag (conj x))) -> (imag x)
+struct NegateImagConj final
+    : CheckedOpRewritePattern<stablehlo::NegOp, NegateImagConj> {
+  using CheckedOpRewritePattern::CheckedOpRewritePattern;
+
+  LogicalResult matchAndRewriteImpl(stablehlo::NegOp op,
+                                    PatternRewriter &rewriter) const {
+    auto imag = op.getOperand().getDefiningOp<stablehlo::ImagOp>();
+    if (!imag)
+      return failure();
+
+    auto conj = imag.getOperand().getDefiningOp<chlo::ConjOp>();
+    if (!conj)
+      return failure();
+
+    rewriter.replaceOpWithNewOp<stablehlo::ImagOp>(op, op.getType(),
+                                                   conj.getOperand());
+    return success();
+  }
+};
+
 struct GetDimensionSizeOpCanon final
     : CheckedOpRewritePattern<stablehlo::GetDimensionSizeOp,
                               GetDimensionSizeOpCanon> {
@@ -20601,11 +20667,121 @@ struct AssociativeCommonMulOpReordering final
   }
 };
 
+// Helper to check if two SplatElementsAttrs are negations of each other.
+static bool areSplatNegationsOf(SplatElementsAttr a, SplatElementsAttr b) {
+
+  auto elementType = a.getElementType();
+  if (elementType != b.getElementType())
+    return false;
+
+  if (isa<FloatType>(elementType)) {
+    APFloat aVal = a.getSplatValue<APFloat>();
+    APFloat bVal = b.getSplatValue<APFloat>();
+    APFloat negA = aVal;
+    negA.changeSign();
+    return negA.bitwiseIsEqual(bVal);
+  }
+
+  if (isa<IntegerType>(elementType)) {
+    APInt aVal = a.getSplatValue<APInt>();
+    APInt bVal = b.getSplatValue<APInt>();
+    return (-aVal) == bVal;
+  }
+
+  return false;
+}
+
+// Optimizes the following patterns:
+// OuterOp=AddOp:
+//   (a * cst) + (b * -cst) -> (a - b) * cst
+// OuterOp=SubtractOp:
+//   (a * cst) - (b * -cst) -> (a + b) * cst
+//
+// All commutative combinations of the multiply operands are considered:
+//   (cst * a), (a * cst), (-cst * b), (b * -cst)
+template <typename OuterOp>
+struct NegatedConstantMulFactoring final
+    : public CheckedOpRewritePattern<OuterOp,
+                                     NegatedConstantMulFactoring<OuterOp>> {
+  using CheckedOpRewritePattern<
+      OuterOp, NegatedConstantMulFactoring<OuterOp>>::CheckedOpRewritePattern;
+
+  // AddOp -> SubtractOp, SubtractOp -> AddOp
+  using ResultOp = std::conditional_t<std::is_same_v<OuterOp, stablehlo::AddOp>,
+                                      stablehlo::SubtractOp, stablehlo::AddOp>;
+
+  LogicalResult matchAndRewriteImpl(OuterOp op,
+                                    PatternRewriter &rewriter) const {
+    auto lhs = op.getLhs();
+    auto rhs = op.getRhs();
+
+    auto lhsMul = lhs.template getDefiningOp<stablehlo::MulOp>();
+    auto rhsMul = rhs.template getDefiningOp<stablehlo::MulOp>();
+
+    if (!lhsMul || !rhsMul) {
+      return failure();
+    }
+
+    // For each mul op, try to extract (nonConst, constAttr) where the constant
+    // side is a splat DenseElementsAttr. We try both operand orders.
+    struct MulInfo {
+      Value nonConst;
+      Value constOperand;
+      SplatElementsAttr constAttr;
+    };
+
+    auto extractMulInfo = [](stablehlo::MulOp mul) -> std::optional<MulInfo> {
+      SplatElementsAttr attr;
+      // Try rhs as constant
+      if (matchPattern(mul.getRhs(), m_Constant(&attr))) {
+        return MulInfo{mul.getLhs(), mul.getRhs(), attr};
+      }
+      // Try lhs as constant
+      if (matchPattern(mul.getLhs(), m_Constant(&attr))) {
+        return MulInfo{mul.getRhs(), mul.getLhs(), attr};
+      }
+      return std::nullopt;
+    };
+
+    auto lhsInfo = extractMulInfo(lhsMul);
+    auto rhsInfo = extractMulInfo(rhsMul);
+
+    if (!lhsInfo || !rhsInfo) {
+      return failure();
+    }
+
+    // Check if the two constants are negations of each other.
+    // areSplatNegationsOf checks if lhsConst == -rhsConst.
+    // This is symmetric, so we only need one check.
+    if (!areSplatNegationsOf(lhsInfo->constAttr, rhsInfo->constAttr)) {
+      return failure();
+    }
+
+    // For OuterOp=AddOp (ResultOp=SubtractOp):
+    //   a * lhsConst + b * rhsConst  (where rhsConst = -lhsConst)
+    //   = a * lhsConst - b * lhsConst = (a - b) * lhsConst
+    // For OuterOp=SubtractOp (ResultOp=AddOp):
+    //   a * lhsConst - b * rhsConst  (where rhsConst = -lhsConst)
+    //   = a * lhsConst + b * lhsConst = (a + b) * lhsConst
+    auto newBinop = ResultOp::create(rewriter, op.getLoc(), lhsInfo->nonConst,
+                                     rhsInfo->nonConst);
+    rewriter.replaceOpWithNewOp<stablehlo::MulOp>(op, newBinop.getResult(),
+                                                  lhsInfo->constOperand);
+    return success();
+  }
+};
+
 // This lets us reorder the following
 // Case 1: (op x (op (op y x) y)) -> (op (op x y) (op x y))
 // Case 2: (op x (op (op x y) y)) -> (op (op x y) (op x y))
 // Case 3: (op x (op y (op x y))) -> (op (op x y) (op x y))
 // Case 4: (op x (op y (op y x))) -> (op (op x y) (op x y))
+// Case 5: (op (op x cst1) cst2) -> (op x (op cst1 cst2))
+// Case 6: (op (op cst1 x) cst2) -> (op x (op cst1 cst2)) only if op is
+// commutative
+// Case 7: (op cst2 (op x cst1)) -> (op (op cst1 cst2) x) only if op is
+// commutative
+// Case 8: (op cst2 (op cst1 x)) -> (op (op cst1 cst2) x)
 struct AssociativeBinaryOpReordering
     : public CheckedOpTraitRewritePattern<OpTrait::Elementwise,
                                           AssociativeBinaryOpReordering> {
@@ -20621,40 +20797,120 @@ struct AssociativeBinaryOpReordering
 
     auto lhs = op->getOperand(0);
     auto rhs = op->getOperand(1);
+    auto lhsOp = lhs.getDefiningOp();
     auto rhsOp = rhs.getDefiningOp();
-    if (!rhsOp || rhsOp->getName() != op->getName())
-      return failure();
 
-    auto rhslhs = rhsOp->getOperand(0);
-    auto rhsrhs = rhsOp->getOperand(1);
+    if (rhsOp && rhsOp->getName() == op->getName()) {
+      auto rhslhs = rhsOp->getOperand(0);
+      auto rhsrhs = rhsOp->getOperand(1);
 
-    auto rhslhsOp = rhslhs.getDefiningOp();
-    if (rhslhsOp && rhslhsOp->getName() == op->getName()) {
-      auto rhslhslhs = rhslhsOp->getOperand(0);
-      auto rhslhsrhs = rhslhsOp->getOperand(1);
+      auto rhslhsOp = rhslhs.getDefiningOp();
+      if (rhslhsOp && rhslhsOp->getName() == op->getName()) {
+        auto rhslhslhs = rhslhsOp->getOperand(0);
+        auto rhslhsrhs = rhslhsOp->getOperand(1);
 
-      // Case 1 || Case 2
-      if ((lhs == rhslhsrhs && rhslhslhs == rhsrhs) ||
-          (lhs == rhslhslhs && rhslhsrhs == rhsrhs)) {
+        // Case 1 || Case 2
+        if ((lhs == rhslhsrhs && rhslhslhs == rhsrhs) ||
+            (lhs == rhslhslhs && rhslhsrhs == rhsrhs)) {
+          rewriter.modifyOpInPlace(op, [&] {
+            op->setOperand(0, rhslhsOp->getResult(0));
+            op->setOperand(1, rhslhsOp->getResult(0));
+          });
+          return success();
+        }
+      }
+
+      auto rhsrhsOp = rhsrhs.getDefiningOp();
+      if (rhsrhsOp && rhsrhsOp->getName() == op->getName()) {
+        auto rhsrhslhs = rhsrhsOp->getOperand(0);
+        auto rhsrhsrhs = rhsrhsOp->getOperand(1);
+
+        // Case 3 || Case 4
+        if ((lhs == rhsrhslhs && rhslhs == rhsrhsrhs) ||
+            (lhs == rhsrhsrhs && rhslhs == rhsrhslhs)) {
+          rewriter.modifyOpInPlace(op, [&] {
+            op->setOperand(0, rhsrhsOp->getResult(0));
+            op->setOperand(1, rhsrhsOp->getResult(0));
+          });
+          return success();
+        }
+      }
+    }
+
+    bool isCommutative = op->hasTrait<mlir::hlo::OpTrait::IsCommutative>() ||
+                         op->hasTrait<mlir::OpTrait::IsCommutative>();
+
+    auto isConstant = [](Value v) -> bool {
+      return matchPattern(v, m_Constant());
+    };
+
+    // Case 5: (op (op x cst1) cst2) -> (op x (op cst1 cst2))
+    if (lhsOp && lhsOp->getName() == op->getName() && isConstant(rhs)) {
+      auto innerRhs = lhsOp->getOperand(1);
+      auto innerLhs = lhsOp->getOperand(0);
+      if (isConstant(innerRhs) && !isConstant(innerLhs)) {
+        // Create (op cst1 cst2) as the new rhs
+        auto cstCombined = rewriter.clone(*op);
+        cstCombined->setOperand(0, innerRhs);
+        cstCombined->setOperand(1, rhs);
         rewriter.modifyOpInPlace(op, [&] {
-          op->setOperand(0, rhslhsOp->getResult(0));
-          op->setOperand(1, rhslhsOp->getResult(0));
+          op->setOperand(0, innerLhs);
+          op->setOperand(1, cstCombined->getResult(0));
         });
         return success();
       }
     }
 
-    auto rhsrhsOp = rhsrhs.getDefiningOp();
-    if (rhsrhsOp && rhsrhsOp->getName() == op->getName()) {
-      auto rhsrhslhs = rhsrhsOp->getOperand(0);
-      auto rhsrhsrhs = rhsrhsOp->getOperand(1);
-
-      // Case 3 || Case 4
-      if ((lhs == rhsrhslhs && rhslhs == rhsrhsrhs) ||
-          (lhs == rhsrhsrhs && rhslhs == rhsrhslhs)) {
+    // Case 6: (op (op cst1 x) cst2) -> (op x (op cst1 cst2))
+    // only if op is commutative
+    if (isCommutative && lhsOp && lhsOp->getName() == op->getName() &&
+        isConstant(rhs)) {
+      auto innerLhs = lhsOp->getOperand(0);
+      auto innerRhs = lhsOp->getOperand(1);
+      if (isConstant(innerLhs) && !isConstant(innerRhs)) {
+        // Create (op cst1 cst2) as the new rhs
+        auto cstCombined = rewriter.clone(*op);
+        cstCombined->setOperand(0, innerLhs);
+        cstCombined->setOperand(1, rhs);
         rewriter.modifyOpInPlace(op, [&] {
-          op->setOperand(0, rhsrhsOp->getResult(0));
-          op->setOperand(1, rhsrhsOp->getResult(0));
+          op->setOperand(0, innerRhs);
+          op->setOperand(1, cstCombined->getResult(0));
+        });
+        return success();
+      }
+    }
+
+    // Case 7: (op cst2 (op x cst1)) -> (op (op cst2 cst1) x)
+    // only if op is commutative
+    if (isCommutative && rhsOp && rhsOp->getName() == op->getName() &&
+        isConstant(lhs)) {
+      auto innerRhs = rhsOp->getOperand(1);
+      auto innerLhs = rhsOp->getOperand(0);
+      if (isConstant(innerRhs) && !isConstant(innerLhs)) {
+        // Create (op cst2 cst1) as the new lhs
+        auto cstCombined = rewriter.clone(*op);
+        cstCombined->setOperand(0, lhs);
+        cstCombined->setOperand(1, innerRhs);
+        rewriter.modifyOpInPlace(op, [&] {
+          op->setOperand(0, cstCombined->getResult(0));
+          op->setOperand(1, innerLhs);
+        });
+        return success();
+      }
+    }
+
+    // Case 8: (op cst2 (op cst1 x)) -> (op (op cst2 cst1) x)
+    if (rhsOp && rhsOp->getName() == op->getName() && isConstant(lhs)) {
+      auto innerLhs = rhsOp->getOperand(0);
+      auto innerRhs = rhsOp->getOperand(1);
+      if (isConstant(innerLhs) && !isConstant(innerRhs)) {
+        // Create (op cst2 cst1) as the new lhs
+        auto cstCombined = rewriter.clone(*op);
+        cstCombined->setOperand(0, lhs);
+        cstCombined->setOperand(1, innerLhs);
+        rewriter.modifyOpInPlace(op, [&] {
+          op->setOperand(0, cstCombined->getResult(0));
+          op->setOperand(1, innerRhs);
         });
         return success();
       }
@@ -27701,6 +27957,166 @@ struct SelfElementwiseToConvolutionLike
       }
     }
 
+    if (!newBaseOp && canEmitReduceWindow) {
+      // Match add(reduce_window(slice(X)), slice(X)) or the symmetric case.
+      // This allows iteratively folding chains of add(slice, slice, ..., slice)
+      // into a single reduce_window across multiple greedy rewriter iterations.
+      //
+      // Given: reduce_window(slice[s:e], window_dim=N) + slice[s+N : e+1]
+      // Produce: reduce_window(slice[s : e+1], window_dim=N+1)
+      //
+      // Similarly for the prepend case:
+      // Given: reduce_window(slice[s:e], window_dim=N) + slice[s-1 : e-N]
+      // Produce: reduce_window(slice[s-1 : e], window_dim=N+1)
+
+      auto tryMatchReduceWindowSlice = [&](Value rwVal,
+                                           Value sliceVal) -> bool {
+        auto rwOp = rwVal.template getDefiningOp<stablehlo::ReduceWindowOp>();
+        if (!rwOp || rwOp.getInputs().size() != 1)
+          return false;
+
+        // Check that the reduce_window body matches OpTy
+        auto commonRW = CheckCommonReduceWindowOp(rwOp);
+        ReduceOpKind expectedKind = ReduceOpKind::Unknown;
+        if constexpr (std::is_base_of_v<stablehlo::AddOp, OpTy>)
+          expectedKind = ReduceOpKind::Add;
+        else if constexpr (std::is_base_of_v<stablehlo::MulOp, OpTy>)
+          expectedKind = ReduceOpKind::Mul;
+        if (commonRW.kind != expectedKind)
+          return false;
+
+        // The reduce_window input must be a slice
+        auto rwInputSlice =
+            rwOp.getInputs()[0].template getDefiningOp<stablehlo::SliceOp>();
+        if (!rwInputSlice)
+          return false;
+
+        // The other operand must also be a slice from the same tensor
+        auto otherSlice = sliceVal.template getDefiningOp<stablehlo::SliceOp>();
+        if (!otherSlice)
+          return false;
+
+        if (rwInputSlice.getOperand() != otherSlice.getOperand())
+          return false;
+
+        // Both slices must have stride 1
+        if (!llvm::all_of(rwInputSlice.getStrides(),
+                          [](int64_t i) { return i == 1; }) ||
+            !llvm::all_of(otherSlice.getStrides(),
+                          [](int64_t i) { return i == 1; }))
+          return false;
+
+        // reduce_window must have no strides, no base_dilations, no padding,
+        // and all window_dilations == 1
+        auto rwWindowStrides = rwOp.getWindowStrides();
+        auto rwBaseDilations = rwOp.getBaseDilations();
+        auto rwWindowDilations = rwOp.getWindowDilations();
+        auto rwPadding = rwOp.getPadding();
+
+        if (rwWindowStrides && !llvm::all_of(rwWindowStrides.value(),
+                                             [](int64_t i) { return i == 1; }))
+          return false;
+        if (rwBaseDilations && !llvm::all_of(rwBaseDilations.value(),
+                                             [](int64_t i) { return i == 1; }))
+          return false;
+        if (rwWindowDilations &&
+            !llvm::all_of(rwWindowDilations.value(),
+                          [](int64_t i) { return i == 1; }))
+          return false;
+        if (rwPadding && !llvm::all_of(rwPadding.value(), [](auto pad_val) {
+              return pad_val == 0;
+            }))
+          return false;
+
+        auto rwWindowDims = rwOp.getWindowDimensions();
+
+        auto rwSliceStarts = rwInputSlice.getStartIndices();
+        auto rwSliceLimits = rwInputSlice.getLimitIndices();
+        auto otherStarts = otherSlice.getStartIndices();
+        auto otherLimits = otherSlice.getLimitIndices();
+
+        // Find the single dimension where the window_dim > 1
+        int64_t rwDim = -1;
+        int64_t rwWindowSize = -1;
+        for (int64_t i = 0; i < outRank; ++i) {
+          if (rwWindowDims[i] != 1) {
+            if (rwDim != -1)
+              return false; // multiple active window dims not supported
+            rwDim = i;
+            rwWindowSize = rwWindowDims[i];
+          }
+        }
+        if (rwDim == -1)
+          return false;
+
+        // All non-active dims must have identical slice bounds
+        for (int64_t i = 0; i < outRank; ++i) {
+          if (i == rwDim)
+            continue;
+          if (rwSliceStarts[i] != otherStarts[i] ||
+              rwSliceLimits[i] != otherLimits[i])
+            return false;
+        }
+
+        // Check if the other slice is adjacent on the right:
+        //   otherStarts[rwDim] == rwSliceStarts[rwDim] + rwWindowSize
+        //   otherLimits[rwDim] == rwSliceLimits[rwDim] + 1
+        bool appendRight =
+            (otherStarts[rwDim] == rwSliceStarts[rwDim] + rwWindowSize) &&
+            (otherLimits[rwDim] == rwSliceLimits[rwDim] + 1);
+
+        // Check if the other slice is adjacent on the left:
+        //   otherStarts[rwDim] == rwSliceStarts[rwDim] - 1
+        //   otherLimits[rwDim] == rwSliceLimits[rwDim] - rwWindowSize
+        bool prependLeft =
+            (otherStarts[rwDim] == rwSliceStarts[rwDim] - 1) &&
+            (otherLimits[rwDim] == rwSliceLimits[rwDim] - rwWindowSize);
+
+        if (!appendRight && !prependLeft)
+          return false;
+
+        // Build the new extended slice
+        SmallVector<int64_t> newStarts(rwSliceStarts.begin(),
+                                       rwSliceStarts.end());
+        SmallVector<int64_t> newLimits(rwSliceLimits.begin(),
+                                       rwSliceLimits.end());
+        SmallVector<int64_t> newStrides(rwInputSlice.getStrides().begin(),
+                                        rwInputSlice.getStrides().end());
+        if (appendRight) {
+          newLimits[rwDim] = rwSliceLimits[rwDim] + 1;
+        } else {
+          newStarts[rwDim] = rwSliceStarts[rwDim] - 1;
+        }
+
+        auto newSlice = stablehlo::SliceOp::create(
+            rewriter, op.getLoc(), rwInputSlice.getOperand(), newStarts,
+            newLimits, newStrides);
+
+        // Build extended window dimensions
+        SmallVector<int64_t> newWindowDims(rwWindowDims.begin(),
+                                           rwWindowDims.end());
+        newWindowDims[rwDim] = rwWindowSize + 1;
+
+        // Reuse the init value from the original reduce_window
+        auto newReduceWindowOp =
+            rewriter.replaceOpWithNewOp<stablehlo::ReduceWindowOp>(
+                op, TypeRange(outType), ValueRange(newSlice.getResult()),
+                rwOp.getInitValues(),
+                rewriter.getDenseI64ArrayAttr(newWindowDims),
+                rwOp.getWindowStridesAttr(), rwOp.getBaseDilationsAttr(),
+                rwOp.getWindowDilationsAttr(), rwOp.getPaddingAttr());
+
+        newReduceWindowOp.getBody().takeBody(rwOp.getBody());
+        return true;
+      };
+
+      // Try both orderings: lhs=reduce_window, rhs=slice and vice versa
+      if (tryMatchReduceWindowSlice(lhsInfo.base, rhsInfo.base) ||
+          tryMatchReduceWindowSlice(rhsInfo.base, lhsInfo.base)) {
+        return success();
+      }
+    }
+
     if (!newBaseOp || windowDilation < 0 || dimension < 0)
       return rewriter.notifyMatchFailure(
           op, "None of the parent op conditions match.");
@@ -33819,6 +34235,8 @@ struct EnzymeHLOOptPass
         SimplifyBoundary<enzymexla::RotateOp>, TransposeReshapeToBroadcast,
         ReshapeTransposeToBroadcast, SelectBroadcastInDim, PowerMultiplyToPower,
         NegMulConstSimplify, NegDivConstSimplify,
+        NegatedConstantMulFactoring<stablehlo::AddOp>,
+        NegatedConstantMulFactoring<stablehlo::SubtractOp>,
         ReshapeDeletionsBroadcastInDimSimplify,
         ReshapeInsertionsBroadcastInDimSimplify, CompareIotaConstSimplify,
         CompareAbs, CompareMul, CompareConvert, AddSelects,
@@ -34099,6 +34517,7 @@ struct EnzymeHLOOptPass
         CompareOpCanon,
         CompareExt,
         ConjComplexNegate,
+        NegateImagConj,
         ConvertOpCanon,
         DivideSqrtToMultiplyRsqrt,
         DynamicBroadcastInDimAllDimsNonExpanding,

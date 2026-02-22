@@ -27,7 +27,9 @@ cc_library(
     srcs = ["gpu.cc"],
     copts = ["-Wno-vla-cxx-extension"],
     deps = [
+        "@xla//xla/ffi:execution_state",
         "@xla//xla/ffi:ffi_api",
+        "@xla//xla/ffi/api:c_api_internal",
         "@xla//xla/ffi/api:ffi",
         "@xla//xla/stream_executor:stream",
     ],
@@ -1439,6 +1441,10 @@ cc_library(
         "@xla//xla/service/spmd/shardy/stablehlo_round_trip:stablehlo_import",
         "@xla//xla/service/spmd/shardy/stablehlo_round_trip:stablehlo_export",
         "@xla//xla/service/spmd/shardy/sdy_round_trip:pipelines",
+
+        # CUDA Tile
+        "@cuda_tile//:CudaTileDialect",
+        "@cuda_tile//:CudaTileTransforms",
     ],
 )
 
