@@ -43,6 +43,9 @@ namespace {
   
     LogicalResult matchAndRewrite(scf::ParallelOp op, PatternRewriter &rewriter) const override {
 
+      // Safety Check: Ensure it's a 1D parallel loop before splitting
+      if (parallelOp.getInductionVars().size() != 1) return failure();
+
       auto loc = op.getLoc();
       
       // --- BUG FIX: Dynamic Element Type Detection ---
@@ -130,18 +133,21 @@ namespace {
 
       // Deal with different types of scalar values
       auto getVecOp = [&](Value scalarVal) -> Value {
-	if (vectorisedMapping.count(scalarVal))
-	  return vectorisedMapping[scalarVal];
-	
-	auto type = scalarVal.getType();
-	// Create a vector version of the scalar type
-	auto vType = VectorType::get({vWidth}, type);
+        if (vectorisedMapping.count(scalarVal))
+          return vectorisedMapping[scalarVal];
+        
+        auto type = scalarVal.getType();
+        auto vType = VectorType::get({vWidth}, type);
 
-	rewriter.setInsertionPointAfterValue(scalarVal);
-	// If it's a constant or a uniform value, splat/broadcast it
-	return rewriter.create<vector::BroadcastOp>(loc, vType, scalarVal).getResult();
-      };
-      
+        // --- BUG FIX: Protect the Rewriter's Insertion Point ---
+        OpBuilder::InsertionGuard guard(rewriter);
+        
+        rewriter.setInsertionPointAfterValue(scalarVal);
+        Value splat = rewriter.create<vector::BroadcastOp>(loc, vType, scalarVal).getResult();
+        
+        vectorisedMapping[scalarVal] = splat;
+        return splat;
+      }; 
       // Transform the body
       for (Operation &innerOp : llvm::make_early_inc_range(*op.getBody())) {
       
@@ -180,7 +186,7 @@ namespace {
                  Value vSafePad = rewriter.create<vector::BroadcastOp>(loc, vSafePadType, safeScalar);
                  
                  // Swap 0.0 to 1.0 for out-of-bounds division
-                 vOp = rewriter.create<arith::SelectOp>(loc, mask, vOp, vSafePad);
+		 vOp = rewriter.create<arith::SelectOp>(loc, mask, vOp, vSafePad).getResult();
               }
               vOperands.push_back(vOp);
             }
@@ -223,8 +229,8 @@ namespace {
           Value vSafePad = rewriter.create<vector::BroadcastOp>(loc, vSafePadType, safeScalarPad);
           
           // Select safe values for inactive tail lanes
-          Value safeInput = rewriter.create<arith::SelectOp>(loc, mask, vInput, vSafePad);
-        
+          Value safeInput = rewriter.create<arith::SelectOp>(loc, mask, vInput, vSafePad).getResult();
+ 
           Operation *vMath = nullptr;
           if (mlir::isa<math::ExpOp>(innerOp))       vMath = rewriter.create<math::ExpOp>(loc, safeInput);
           else if (mlir::isa<math::SinOp>(innerOp))  vMath = rewriter.create<math::SinOp>(loc, safeInput);
@@ -303,15 +309,18 @@ namespace {
             // UNIFORM: All lanes add to the exact same memory address.
             // Safely mask inactive padding lanes by replacing them with 0.0
             Value neutralElement = rewriter.create<arith::ConstantOp>(loc, vType, rewriter.getZeroAttr(vType));
-            Value maskedVal = rewriter.create<arith::SelectOp>(loc, mask, vVal, neutralElement);
             
+            // Uniform Select:
+            Value maskedVal = rewriter.create<arith::SelectOp>(loc, mask, vVal, neutralElement).getResult();
+
             // Reduce the vector into a scalar
             auto reduction = rewriter.create<vector::ReductionOp>(loc, vector::CombiningKind::ADD, maskedVal);
             
             // Issue a single scalar atomic
-            rewriter.create<memref::AtomicRMWOp>(
-                loc, atomic.getKind(), reduction.getResult(), atomic.getMemref(), atomic.getIndices());
-          } else {
+            rewriter.create<memref::AtomicRMWOp>(loc, atomic.getKind(), reduction.getResult(), atomic.getMemref(), atomic.getIndices());
+
+
+	  } else {
             // VARYING (SCATTER): Lanes write to different addresses.
             // MLIR vector lacks a universal scatter-atomic, so we unroll over the vector width.
             
@@ -324,17 +333,17 @@ namespace {
             // Unroll over the vector width
             for (int64_t i = 0; i < vWidth; ++i) {
               // Extract the mask bit for this specific lane
-              Value laneMask = rewriter.create<vector::ExtractOp>(loc, mask, ArrayRef<int64_t>{i});
+              Value laneMask = rewriter.create<vector::ExtractOp>(loc, mask, ArrayRef<int64_t>{i}).getResult();
               
               // Conditionally execute the atomic using scf.if
               rewriter.create<scf::IfOp>(loc, laneMask, [&](OpBuilder &b, Location l) {
                 // Extract the value to add
-                Value laneVal = b.create<vector::ExtractOp>(l, vVal, ArrayRef<int64_t>{i});
+                Value laneVal = b.create<vector::ExtractOp>(l, vVal, ArrayRef<int64_t>{i}).getResult();
                 
                 // Extract the specific memory indices for this lane
                 SmallVector<Value, 4> laneIndices;
                 for (Value vIdx : vIndices) {
-                  laneIndices.push_back(b.create<vector::ExtractOp>(l, vIdx, ArrayRef<int64_t>{i}));
+                  laneIndices.push_back(b.create<vector::ExtractOp>(l, vIdx, ArrayRef<int64_t>{i})).getResult();
                 }
                 
                 // Issue the scalar atomic for this lane
@@ -471,19 +480,24 @@ struct BarrierFissionPattern : public OpRewritePattern<scf::ParallelOp> {
 
       // Move shared memory (CUDA) to stack (Alloca)
       // We place it at the top of the block parallel loop (grid loop body)
+      // We collect them first to avoid iterator invalidation during mutation
+      SmallVector<gpu::AllocOp> allocsToMove;
       module.walk([&](gpu::AllocOp alloc) {
-	if (auto intAttr = mlir::dyn_cast_or_null<IntegerAttr>(alloc.getType().getMemorySpace())) {
-	  if (intAttr.getInt() == 3) {
-	    OpBuilder b(alloc);
-	    func::FuncOp parentFunc = alloc->getParentOfType<func::FuncOp>();
-            OpBuilder hoistedBuilder(&parentFunc.getBody().front(), parentFunc.getBody().front().begin());
-            auto stackMem = hoistedBuilder.create<memref::AllocaOp>(alloc.getLoc(), mlir::cast<MemRefType>(alloc.getType()));
-	    alloc->getResult(0).replaceAllUsesWith(stackMem->getResult(0));
-	    alloc.erase();
-	  }
-	}
+        if (auto intAttr = mlir::dyn_cast_or_null<IntegerAttr>(alloc.getType().getMemorySpace())) {
+          if (intAttr.getInt() == 3) {
+            allocsToMove.push_back(alloc);
+          }
+        }
       });
 
+      for (auto alloc : allocsToMove) {
+        func::FuncOp parentFunc = alloc->getParentOfType<func::FuncOp>();
+        if (!parentFunc) continue; // Safety check
+        OpBuilder hoistedBuilder(&parentFunc.getBody().front(), parentFunc.getBody().front().begin());
+        auto stackMem = hoistedBuilder.create<memref::AllocaOp>(alloc.getLoc(), mlir::cast<MemRefType>(alloc.getType()));
+        alloc->getResult(0).replaceAllUsesWith(stackMem->getResult(0));
+        alloc.erase();
+      }
       // Apply Barrier Fission to split loops securely before vectorisation happens
       RewritePatternSet prePatterns(ctx);
       prePatterns.add<BarrierFissionPattern>(ctx);
@@ -498,7 +512,6 @@ struct BarrierFissionPattern : public OpRewritePattern<scf::ParallelOp> {
         signalPassFailure();
       }
 
-      }
     }
   };
     
