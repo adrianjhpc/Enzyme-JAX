@@ -1095,6 +1095,23 @@ def SCFParallelLoopUnroll : Pass<"scf-parallel-loop-unroll"> {
   ];
 }
 
+
+def CUDAToHierarchicalParallel : Pass<"cuda-to-hierarchical-parallel", "mlir::ModuleOp"> {
+  let summary = "Vectorise parallel loops raised from CUDA/HIP and apply OpenMP";
+  let dependentDialects = [
+    "arith::ArithDialect",
+    "vector::VectorDialect",
+    "scf::SCFDialect",
+    "gpu::GPUDialect",
+    "memref::MemRefDialect",
+    "math::MathDialect"      
+  ];
+  let options = [
+    Option<"regBitWidth", "reg-bit-width", "int", /*default=*/"256",
+           "Hardware register bit-width">
+  ];
+}
+
 def ParallelLICM : Pass<"parallel-licm"> {
   let summary = "Perform LICM on known parallel (and serial) loops";
 }
