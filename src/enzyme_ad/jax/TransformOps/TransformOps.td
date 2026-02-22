@@ -1003,6 +1003,11 @@ def ConjComplexNegatePatterns : EnzymeHLOPatternOp<
   let patterns = ["ConjComplexNegate"];
 }
 
+def NegateImagConjPatterns : EnzymeHLOPatternOp<
+    "negate_imag_conj"> {
+  let patterns = ["NegateImagConj"];
+}
+
 def GetDimensionSizeOpCanonPatterns : EnzymeHLOPatternOp<
     "get_dimension_size_op_canon"> {
   let patterns = ["GetDimensionSizeOpCanon"];
@@ -2562,6 +2567,11 @@ def ApplyNegMulConstSimplify : EnzymeHLOPatternOp<"neg_mul_const_simplify"> {
 
 def ApplyNegDivConstSimplify : EnzymeHLOPatternOp<"neg_div_const_simplify"> {
   let patterns = ["NegDivConstSimplify"];
+}
+
+def ApplyNegatedConstantMulFactoring : EnzymeHLOPatternOp<"negated_constant_mul_factoring"> {
+  let patterns = ["NegatedConstantMulFactoring<stablehlo::AddOp>",
+                  "NegatedConstantMulFactoring<stablehlo::SubtractOp>"];
 }
 
 def ApplyReshapeDeletionsBroadcastInDimSimplify : EnzymeHLOPatternOp<"reshape_deletions_broadcast_in_dim_simplify"> {
