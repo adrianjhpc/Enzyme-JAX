@@ -48,7 +48,7 @@ namespace {
 
       auto loc = op.getLoc();
       
-      // --- BUG FIX: Dynamic Element Type Detection ---
+      // Dynamic Element Type Detection
       Type elementType = rewriter.getF32Type(); // default fallback
       for (auto &innerOp : *op.getBody()) {
         if (auto load = dyn_cast<memref::LoadOp>(innerOp)) {
@@ -76,13 +76,13 @@ namespace {
     
       // Update loop step to vWidth
       rewriter.modifyOpInPlace(op, [&]() {
-        Value newStep = rewriter.create<arith::ConstantIndexOp>(loc, vWidth);
+	Value newStep = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(vWidth));
         op.getStepMutable().assign(newStep);
       });
     
       rewriter.setInsertionPointToStart(op.getBody());
     
-      // --- BUG FIX: Thread ID Vectorization with Dynamic Types ---
+      // Thread ID Vectorization with Dynamic Types
       Value baseThreadId;
       if (isa<FloatType>(elementType)) {
         // Cast index -> i32 -> float
@@ -95,7 +95,7 @@ namespace {
       Value splatIv = rewriter.create<vector::BroadcastOp>(loc, vType, baseThreadId).getResult();
 
       // Dynamically create sequence offsets [0, 1, 2, ... vWidth-1]
-      Attribute offsetsAttr;
+      DenseElementsAttr offsetsAttr; // <--- FIX HERE
       if (auto floatType = dyn_cast<FloatType>(elementType)) {
         SmallVector<APFloat, 8> offsets;
         for (int64_t i = 0; i < vWidth; ++i) offsets.push_back(APFloat(floatType.getFloatSemantics(), i));
@@ -105,8 +105,8 @@ namespace {
         for (int64_t i = 0; i < vWidth; ++i) offsets.push_back(APInt(intType.getWidth(), i));
         offsetsAttr = DenseElementsAttr::get(vType, offsets);
       }
-      Value offsetsConst = rewriter.create<arith::ConstantOp>(loc, vType, offsetsAttr);
-    
+      Value offsetsConst = rewriter.create<arith::ConstantOp>(loc, offsetsAttr);
+      
       Value vectorisedThreadId;
       if (isa<FloatType>(elementType)) {
         vectorisedThreadId = rewriter.create<arith::AddFOp>(loc, splatIv, offsetsConst);
@@ -123,13 +123,13 @@ namespace {
       Value diff = rewriter.create<arith::SubIOp>(loc, ub, scalarIv).getResult();
       Value mask = rewriter.create<vector::CreateMaskOp>(loc, maskType, diff);
 
-      // --- BUG FIX: Dynamic Zero Padding ---
+      // Dynamic Zero Padding
       Value zeroPadding;
       if (auto floatType = dyn_cast<FloatType>(elementType)) {
-          zeroPadding = rewriter.create<arith::ConstantOp>(loc, floatType, rewriter.getFloatAttr(floatType, 0.0));
+          zeroPadding = rewriter.create<arith::ConstantOp>(loc, rewriter.getFloatAttr(floatType, 0.0));
       } else if (auto intType = dyn_cast<IntegerType>(elementType)) {
-          zeroPadding = rewriter.create<arith::ConstantIntOp>(loc, 0, intType.getWidth());
-      }    
+          zeroPadding = rewriter.create<arith::ConstantOp>(loc, rewriter.getIntegerAttr(intType, 0));
+      }
 
       // Deal with different types of scalar values
       auto getVecOp = [&](Value scalarVal) -> Value {
@@ -139,7 +139,7 @@ namespace {
         auto type = scalarVal.getType();
         auto vType = VectorType::get({vWidth}, type);
 
-        // --- BUG FIX: Protect the Rewriter's Insertion Point ---
+	// Protect the Rewriter's Insertion Point
         OpBuilder::InsertionGuard guard(rewriter);
         
         rewriter.setInsertionPointAfterValue(scalarVal);
@@ -172,16 +172,17 @@ namespace {
             for (auto [idx, operand] : llvm::enumerate(innerOp.getOperands())) {
               Value vOp = getVecOp(operand);
               
-              // --- TAIL MASKING FIX: Protect Division by Zero ---
+              // Protect Division by Zero 
               // If this is the right-hand side (idx == 1) of a division, prevent X / 0.0 on padding lanes
               if (idx == 1 && mlir::isa<arith::DivFOp, arith::DivSIOp, arith::DivUIOp>(innerOp)) {
                  Type opElemType = mlir::cast<VectorType>(vOp.getType()).getElementType();
                  Value safeScalar;
-                 if (auto fType = dyn_cast<FloatType>(opElemType)) {
-                     safeScalar = rewriter.create<arith::ConstantOp>(loc, fType, rewriter.getFloatAttr(fType, 1.0));
+		 if (auto fType = dyn_cast<FloatType>(opElemType)) {
+                     safeScalar = rewriter.create<arith::ConstantOp>(loc, rewriter.getFloatAttr(fType, 1.0));
                  } else if (auto iType = dyn_cast<IntegerType>(opElemType)) {
-                     safeScalar = rewriter.create<arith::ConstantIntOp>(loc, 1, iType.getWidth());
+                     safeScalar = rewriter.create<arith::ConstantOp>(loc, rewriter.getIntegerAttr(iType, 1));
                  }
+		 
                  VectorType vSafePadType = VectorType::get({vWidth}, opElemType);
                  Value vSafePad = rewriter.create<vector::BroadcastOp>(loc, vSafePadType, safeScalar);
                  
@@ -213,16 +214,17 @@ namespace {
           Value scalarInput = innerOp.getOperand(0);
           Value vInput = getVecOp(scalarInput);
         
-          // --- TAIL MASKING FIX: Protect against NaN/Inf FPEs in padded lanes ---
+          // Protect against NaN/Inf FPEs in padded lanes
           Type opElemType = mlir::cast<VectorType>(vInput.getType()).getElementType();
           Value safeScalarPad;
           
           // Provide 1.0 for Log/Sqrt to prevent evaluating Log(0.0)= -Inf or Sqrt(-x)= NaN. 
           // Otherwise default to 0.0.
           if (mlir::isa<math::LogOp, math::SqrtOp>(innerOp)) {
-            safeScalarPad = rewriter.create<arith::ConstantOp>(loc, opElemType, rewriter.getFloatAttr(mlir::cast<FloatType>(opElemType), 1.0));
+	    safeScalarPad = rewriter.create<arith::ConstantOp>(loc, rewriter.getFloatAttr(mlir::cast<FloatType>(opElemType), 1.0));
+ 
           } else {
-            safeScalarPad = rewriter.create<arith::ConstantOp>(loc, opElemType, rewriter.getFloatAttr(mlir::cast<FloatType>(opElemType), 0.0));
+	    safeScalarPad = rewriter.create<arith::ConstantOp>(loc, rewriter.getFloatAttr(mlir::cast<FloatType>(opElemType), 0.0));
           }
           
           VectorType vSafePadType = VectorType::get({vWidth}, opElemType);
@@ -251,7 +253,7 @@ namespace {
             Value vBase = getVecOp(scalarBase);
             Value vExp = getVecOp(scalarExp);
         
-            // --- TAIL MASKING FIX: Protect against NaN/Inf FPEs ---
+            // Protect against NaN/Inf FPEs
             Type opElemType = mlir::cast<VectorType>(vBase.getType()).getElementType();
           
             // Safe padding for powf: 1.0 ^ 1.0 = 1.0 (safe, no FPEs)
@@ -384,7 +386,7 @@ namespace {
           if (isUniformAddress) {
             // UNIFORM: All lanes add to the exact same memory address.
             // Safely mask inactive padding lanes by replacing them with 0.0
-            Value neutralElement = rewriter.create<arith::ConstantOp>(loc, vType, rewriter.getZeroAttr(vType));
+	    Value neutralElement = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(vType));
             
             // Uniform Select:
             Value maskedVal = rewriter.create<arith::SelectOp>(loc, mask, vVal, neutralElement).getResult();
