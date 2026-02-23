@@ -322,13 +322,28 @@ namespace {
           switch (sgReduce.getOp()) {
             case gpu::AllReduceOperation::ADD: kind = vector::CombiningKind::ADD; break;
             case gpu::AllReduceOperation::MUL: kind = vector::CombiningKind::MUL; break;
-            case gpu::AllReduceOperation::MINNUM: kind = vector::CombiningKind::MINF; break;
-            case gpu::AllReduceOperation::MAXNUM: kind = vector::CombiningKind::MAXF; break;
-            // Add integer cases (MINUI, MINSI) as needed
-            default: return rewriter.notifyMatchFailure(sgReduce, "Unsupported reduction kind");
-          }
-
-          // Reduce the vector into a scalar
+            
+            // Floating Point Reductions (Updated for modern MLIR)
+            case gpu::AllReduceOperation::MINNUMF: kind = vector::CombiningKind::MINNUMF; break;
+            case gpu::AllReduceOperation::MAXNUMF: kind = vector::CombiningKind::MAXNUMF; break;
+            
+            // Signed Integer Reductions
+            case gpu::AllReduceOperation::MINSI: kind = vector::CombiningKind::MINSI; break;
+            case gpu::AllReduceOperation::MAXSI: kind = vector::CombiningKind::MAXSI; break;
+            
+            // Unsigned Integer Reductions
+            case gpu::AllReduceOperation::MINUI: kind = vector::CombiningKind::MINUI; break;
+            case gpu::AllReduceOperation::MAXUI: kind = vector::CombiningKind::MAXUI; break;
+            
+            // Bitwise Reductions
+            case gpu::AllReduceOperation::AND: kind = vector::CombiningKind::AND; break;
+            case gpu::AllReduceOperation::OR:  kind = vector::CombiningKind::OR; break;
+            case gpu::AllReduceOperation::XOR: kind = vector::CombiningKind::XOR; break;
+            
+            default: 
+                // Return a graceful match failure rather than crashing
+                return rewriter.notifyMatchFailure(sgReduce, "Unsupported reduction kind");
+	  // Reduce the vector into a scalar
           Value scalarReduction = rewriter.create<vector::ReductionOp>(loc, kind, vInput).getResult();
           
           // A subgroup reduction returns the scalar result to ALL threads, 
@@ -337,7 +352,8 @@ namespace {
           
           vectorisedMapping[sgReduce.getResult()] = vBroadcastBack;
           rewriter.replaceOp(sgReduce, vBroadcastBack);
-        }
+	  }
+	}
 
 	// --- STORE ---
 	else if (auto store = dyn_cast<memref::StoreOp>(innerOp)) {
@@ -419,8 +435,10 @@ namespace {
     
       return success();
     }
-
   };
+ 
+
+
 
 
 struct BarrierFissionPattern : public OpRewritePattern<scf::ParallelOp> {
@@ -440,9 +458,7 @@ struct BarrierFissionPattern : public OpRewritePattern<scf::ParallelOp> {
       Location loc = parallelOp.getLoc();
       
       // We assume a 1D parallel loop for simplicity (standard for threadIdx.x flattening)
-      Value lb = parallelOp.getLowerBound()[0];
       Value ub = parallelOp.getUpperBound()[0];
-      Value step = parallelOp.getStep()[0];
       Value iv1 = parallelOp.getInductionVars()[0];
 
       // 2. Identify Scalar Expansion candidates (values defined before barrier, used after)
