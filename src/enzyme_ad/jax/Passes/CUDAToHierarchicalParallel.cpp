@@ -207,8 +207,8 @@ namespace {
         }
 
         // --- MATH OPERATIONS ---
-        else if (mlir::isa<math::ExpOp, math::SqrtOp, math::TanhOp, math::SinOp, math::CosOp, math::LogOp>(innerOp)) {
-          rewriter.setInsertionPoint(&innerOp);
+        else if (mlir::isa<math::ExpOp, math::SqrtOp, math::RsqrtOp, math::TanhOp, math::ErfOp, math::SinOp, math::CosOp, math::LogOp, math::PowFOp>(innerOp)) {
+     	  rewriter.setInsertionPoint(&innerOp);
         
           Value scalarInput = innerOp.getOperand(0);
           Value vInput = getVecOp(scalarInput);
@@ -238,8 +238,10 @@ namespace {
           else if (mlir::isa<math::TanhOp>(innerOp)) vMath = rewriter.create<math::TanhOp>(loc, safeInput);
           else if (mlir::isa<math::LogOp>(innerOp))  vMath = rewriter.create<math::LogOp>(loc, safeInput);
           else if (mlir::isa<math::SqrtOp>(innerOp)) vMath = rewriter.create<math::SqrtOp>(loc, safeInput);
-        
-          if (vMath) {
+          else if (mlir::isa<math::RsqrtOp>(innerOp)) vMath = rewriter.create<math::RsqrtOp>(loc, safeInput);
+          else if (mlir::isa<math::ErfOp>(innerOp))   vMath = rewriter.create<math::ErfOp>(loc, safeInput); 
+
+	  if (vMath) {
             vectorisedMapping[innerOp.getResult(0)] = vMath->getResult(0);
             rewriter.replaceOp(&innerOp, vMath->getResults());
           }
