@@ -144,6 +144,8 @@ namespace {
       if (targetBitWidth % bitWidth != 0) {
         return rewriter.notifyMatchFailure(op, "Incompatible register/element width");
       }
+      if (targetBitWidth <= 0) return failure();
+
       
       unsigned vWidth = targetBitWidth / bitWidth;
       
@@ -214,8 +216,18 @@ namespace {
         if (vectorisedMapping.count(scalarVal))
           return vectorisedMapping[scalarVal];
         
-        auto type = scalarVal.getType();
-        auto vType = VectorType::get({vWidth}, type);
+
+        Type type = scalarVal.getType();
+    
+        // If it's an index (like a secondary loop counter), cast it to i64 first
+        if (type.isIndex()) {
+          OpBuilder::InsertionGuard guard(rewriter);
+          rewriter.setInsertionPointAfterValue(scalarVal);
+          scalarVal = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), scalarVal);
+          type = rewriter.getI64Type();
+        }
+
+        VectorType vType = VectorType::get({vWidth}, type);
 
         OpBuilder::InsertionGuard guard(rewriter);
         
@@ -228,7 +240,7 @@ namespace {
 
       // Transform the body
       for (Operation &innerOp : llvm::make_early_inc_range(*op.getBody())) {
-      
+        if (innerOp.hasTrait<OpTrait::IsTerminator>()) continue; 
         // --- LOAD ---
         if (auto load = dyn_cast<memref::LoadOp>(innerOp)) {
           rewriter.setInsertionPoint(load);
