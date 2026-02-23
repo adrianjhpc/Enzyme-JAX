@@ -239,6 +239,71 @@ namespace {
           vectorisedMapping[load.getResult()] = vRead.getResult(); 
           rewriter.replaceOp(load, vRead.getResult());
         }
+
+// --- GPU THREAD ID ---
+        else if (auto threadId = dyn_cast<gpu::ThreadIdOp>(innerOp)) {
+          rewriter.setInsertionPoint(threadId);
+          if (threadId.getDimension() == gpu::Dimension::x) {
+            // Map threadIdx.x exactly to the inner loop's scalar induction variable.
+            // This provides the scalar base for memref indices, 
+            // and getVecOp() will automatically yield the SIMD vector for math!
+            rewriter.replaceOp(threadId, scalarIv);
+          } else {
+            // Y and Z dimensions are 0 (Since we flattened to 1D)
+            Value zero = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
+            rewriter.replaceOp(threadId, zero);
+          }
+        }
+        
+        // --- GPU BLOCK ID ---
+        else if (auto blockId = dyn_cast<gpu::BlockIdOp>(innerOp)) {
+          rewriter.setInsertionPoint(blockId);
+          if (blockId.getDimension() == gpu::Dimension::x) {
+            // Block ID is the induction variable of the OUTER loop
+            auto outerLoop = op->getParentOfType<scf::ParallelOp>();
+            if (outerLoop && !outerLoop.getInductionVars().empty()) {
+              Value bId = outerLoop.getInductionVars()[0];
+              rewriter.replaceOp(blockId, bId);
+            } else {
+              Value zero = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
+              rewriter.replaceOp(blockId, zero);
+            }
+          } else {
+            Value zero = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
+            rewriter.replaceOp(blockId, zero);
+          }
+        }
+
+        // --- GPU BLOCK DIMENSION ---
+        else if (auto blockDim = dyn_cast<gpu::BlockDimOp>(innerOp)) {
+          rewriter.setInsertionPoint(blockDim);
+          if (blockDim.getDimension() == gpu::Dimension::x) {
+            // Block dimension is exactly the inner loop's upper bound
+            rewriter.replaceOp(blockDim, ub);
+          } else {
+            Value one = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));
+            rewriter.replaceOp(blockDim, one);
+          }
+        }
+
+        // --- GPU GRID DIMENSION ---
+        else if (auto gridDim = dyn_cast<gpu::GridDimOp>(innerOp)) {
+          rewriter.setInsertionPoint(gridDim);
+          if (gridDim.getDimension() == gpu::Dimension::x) {
+            // Grid dimension is the upper bound of the OUTER loop
+            auto outerLoop = op->getParentOfType<scf::ParallelOp>();
+            if (outerLoop && !outerLoop.getUpperBound().empty()) {
+              Value gDim = outerLoop.getUpperBound()[0];
+              rewriter.replaceOp(gridDim, gDim);
+            } else {
+              Value one = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));
+              rewriter.replaceOp(gridDim, one);
+            }
+          } else {
+            Value one = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));
+            rewriter.replaceOp(gridDim, one);
+          }
+        }	
       
         // --- GENERIC ARITHMETIC HANDLER ---
         else if (innerOp.getDialect()->getNamespace() == "arith") {
@@ -526,6 +591,8 @@ namespace {
     using Base::Base;
   
     void runOnOperation() override {
+      llvm::errs() << "RUNNING CUDA TO HIERARCHICAL PASS\n";
+
       ModuleOp module = getOperation();
       MLIRContext *ctx = &getContext();
  
