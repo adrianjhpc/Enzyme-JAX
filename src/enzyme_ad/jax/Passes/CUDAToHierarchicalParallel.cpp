@@ -40,6 +40,7 @@ namespace {
     using OpRewritePattern<scf::ParallelOp>::OpRewritePattern;
 
     LogicalResult matchAndRewrite(scf::ParallelOp op, PatternRewriter &rewriter) const override {
+
       unsigned numDims = op.getInductionVars().size();
       if (numDims <= 1) return failure(); // Already 1D, nothing to do.
 
@@ -145,10 +146,13 @@ namespace {
         return rewriter.notifyMatchFailure(op, "Incompatible register/element width");
       }
       if (targetBitWidth <= 0) return failure();
-
       
       unsigned vWidth = targetBitWidth / bitWidth;
-      
+     
+      if (vWidth <= 1) {
+        return rewriter.notifyMatchFailure(op, "Vector width too small for vectorization");
+      }
+
       VectorType vType = VectorType::get({vWidth}, elementType);
       VectorType maskType = VectorType::get({vWidth}, rewriter.getI1Type());
     
@@ -175,16 +179,20 @@ namespace {
       }
       Value splatIv = rewriter.create<vector::BroadcastOp>(loc, vType, baseThreadId).getResult();
 
-      DenseElementsAttr offsetsAttr; 
+
+      SmallVector<Attribute, 8> offsetAttrs;
       if (auto floatType = dyn_cast<FloatType>(elementType)) {
-        SmallVector<APFloat, 8> offsets;
-        for (int64_t i = 0; i < vWidth; ++i) offsets.push_back(APFloat(floatType.getFloatSemantics(), i));
-        offsetsAttr = DenseElementsAttr::get(vType, offsets);
+        for (int64_t i = 0; i < vWidth; ++i) {
+          offsetAttrs.push_back(rewriter.getFloatAttr(floatType, (double)i));
+        }
       } else if (auto intType = dyn_cast<IntegerType>(elementType)) {
-        SmallVector<APInt, 8> offsets;
-        for (int64_t i = 0; i < vWidth; ++i) offsets.push_back(APInt(intType.getWidth(), i));
-        offsetsAttr = DenseElementsAttr::get(vType, offsets);
+        for (int64_t i = 0; i < vWidth; ++i) {
+          offsetAttrs.push_back(rewriter.getIntegerAttr(intType, i));
+        }
       }
+      auto offsetsAttr = DenseElementsAttr::get(vType, offsetAttrs);
+      
+      if (!offsetsAttr) return failure();
       Value offsetsConst = rewriter.create<arith::ConstantOp>(loc, offsetsAttr);
       
       Value vectorisedThreadId;
@@ -211,32 +219,30 @@ namespace {
           zeroPadding = rewriter.create<arith::ConstantOp>(loc, rewriter.getIntegerAttr(intType, 0));
       }
 
-      // Deal with different types of scalar values
       auto getVecOp = [&](Value scalarVal) -> Value {
         if (vectorisedMapping.count(scalarVal))
           return vectorisedMapping[scalarVal];
-        
-
+    
         Type type = scalarVal.getType();
     
-        // If it's an index (like a secondary loop counter), cast it to i64 first
+        // MLIR Vectors do not support 'index' elements.
+        // We must cast indices to a fixed-width integer (i64) before vectorizing.
         if (type.isIndex()) {
           OpBuilder::InsertionGuard guard(rewriter);
           rewriter.setInsertionPointAfterValue(scalarVal);
           scalarVal = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), scalarVal);
           type = rewriter.getI64Type();
-        }
+        } 
 
-        VectorType vType = VectorType::get({vWidth}, type);
-
+        VectorType vType = VectorType::get({(int64_t)vWidth}, type);
+    
         OpBuilder::InsertionGuard guard(rewriter);
-        
         rewriter.setInsertionPointAfterValue(scalarVal);
         Value splat = rewriter.create<vector::BroadcastOp>(loc, vType, scalarVal).getResult();
-        
+    
         vectorisedMapping[scalarVal] = splat;
         return splat;
-      }; 
+      };
 
       // Transform the body
       for (Operation &innerOp : llvm::make_early_inc_range(*op.getBody())) {
@@ -611,7 +617,7 @@ namespace {
       assert(regBitWidth > 0 && "expected positive bit width for vectorisation");
       assert((regBitWidth & (regBitWidth - 1)) == 0 && "expected the bit width for vectorisation to be a power of 2");
 
-      int finalWidth = regBitWidth; 
+      int finalWidth = (regBitWidth > 0) ? regBitWidth : 256; 
 
       if (auto attr = module->getAttrOfType<StringAttr>("llvm.target_features")) {
         llvm::StringRef features = attr.getValue();
