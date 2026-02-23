@@ -281,6 +281,32 @@ namespace {
 	
 	}
 
+        // --- SUBGROUP / WARP REDUCTION ---
+        else if (auto sgReduce = dyn_cast<gpu::SubgroupReduceOp>(innerOp)) {
+          rewriter.setInsertionPoint(sgReduce);
+          Value vInput = getVecOp(sgReduce.getValue());
+          
+          vector::CombiningKind kind;
+          switch (sgReduce.getOp()) {
+            case gpu::AllReduceOperation::ADD: kind = vector::CombiningKind::ADD; break;
+            case gpu::AllReduceOperation::MUL: kind = vector::CombiningKind::MUL; break;
+            case gpu::AllReduceOperation::MINNUM: kind = vector::CombiningKind::MINF; break;
+            case gpu::AllReduceOperation::MAXNUM: kind = vector::CombiningKind::MAXF; break;
+            // Add integer cases (MINUI, MINSI) as needed
+            default: return rewriter.notifyMatchFailure(sgReduce, "Unsupported reduction kind");
+          }
+
+          // Reduce the vector into a scalar
+          Value scalarReduction = rewriter.create<vector::ReductionOp>(loc, kind, vInput).getResult();
+          
+          // A subgroup reduction returns the scalar result to ALL threads, 
+          // so broadcast it back out to the vector
+          Value vBroadcastBack = rewriter.create<vector::BroadcastOp>(loc, vType, scalarReduction).getResult();
+          
+          vectorisedMapping[sgReduce.getResult()] = vBroadcastBack;
+          rewriter.replaceOp(sgReduce, vBroadcastBack);
+        }
+
 	// --- STORE ---
 	else if (auto store = dyn_cast<memref::StoreOp>(innerOp)) {
 	  rewriter.setInsertionPoint(store);
