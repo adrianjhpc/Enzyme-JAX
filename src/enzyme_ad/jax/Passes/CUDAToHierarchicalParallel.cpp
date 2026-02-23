@@ -44,7 +44,7 @@ namespace {
     LogicalResult matchAndRewrite(scf::ParallelOp op, PatternRewriter &rewriter) const override {
 
       // Safety Check: Ensure it's a 1D parallel loop before splitting
-      if (parallelOp.getInductionVars().size() != 1) return failure();
+      if (op.getInductionVars().size() != 1) return failure();
 
       auto loc = op.getLoc();
       
@@ -343,7 +343,7 @@ namespace {
                 // Extract the specific memory indices for this lane
                 SmallVector<Value, 4> laneIndices;
                 for (Value vIdx : vIndices) {
-                  laneIndices.push_back(b.create<vector::ExtractOp>(l, vIdx, ArrayRef<int64_t>{i})).getResult();
+                  laneIndices.push_back(b.create<vector::ExtractOp>(l, vIdx, ArrayRef<int64_t>{i}).getResult());
                 }
                 
                 // Issue the scalar atomic for this lane
