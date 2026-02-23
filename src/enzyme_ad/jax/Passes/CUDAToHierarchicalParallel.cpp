@@ -239,7 +239,39 @@ namespace {
           else if (mlir::isa<math::LogOp>(innerOp))  vMath = rewriter.create<math::LogOp>(loc, safeInput);
           else if (mlir::isa<math::SqrtOp>(innerOp)) vMath = rewriter.create<math::SqrtOp>(loc, safeInput);
           else if (mlir::isa<math::RsqrtOp>(innerOp)) vMath = rewriter.create<math::RsqrtOp>(loc, safeInput);
-          else if (mlir::isa<math::ErfOp>(innerOp))   vMath = rewriter.create<math::ErfOp>(loc, safeInput); 
+          else if (mlir::isa<math::ErfOp>(innerOp))   vMath = rewriter.create<math::ErfOp>(loc, safeInput);
+	  else if (mlir::isa<math::PowFOp>(innerOp)) {
+
+            auto powf = dyn_cast<math::PowFOp>(innerOp);
+            rewriter.setInsertionPoint(powf);
+        
+            // Extract both the Base and the Exponent
+            Value scalarBase = powf.getOperand(0);
+            Value scalarExp = powf.getOperand(1);
+            Value vBase = getVecOp(scalarBase);
+            Value vExp = getVecOp(scalarExp);
+        
+            // --- TAIL MASKING FIX: Protect against NaN/Inf FPEs ---
+            Type opElemType = mlir::cast<VectorType>(vBase.getType()).getElementType();
+          
+            // Safe padding for powf: 1.0 ^ 1.0 = 1.0 (safe, no FPEs)
+            Value safeScalarPad = rewriter.create<arith::ConstantOp>(
+                loc, opElemType, rewriter.getFloatAttr(mlir::cast<FloatType>(opElemType), 1.0));
+          
+            VectorType vSafePadType = VectorType::get({vWidth}, opElemType);
+            Value vSafePad = rewriter.create<vector::BroadcastOp>(loc, vSafePadType, safeScalarPad).getResult();
+          
+            // Select safe values for inactive tail lanes for BOTH operands
+            Value safeBase = rewriter.create<arith::SelectOp>(loc, mask, vBase, vSafePad).getResult();
+            Value safeExp = rewriter.create<arith::SelectOp>(loc, mask, vExp, vSafePad).getResult();
+        
+            // Create the vectorised PowFOp
+            auto vPowf = rewriter.create<math::PowFOp>(loc, safeBase, safeExp);
+        
+            // Register the result and replace the original operation
+            vectorisedMapping[powf.getResult()] = vPowf.getResult();
+            rewriter.replaceOp(powf, vPowf.getResult());
+          }
 
 	  if (vMath) {
             vectorisedMapping[innerOp.getResult(0)] = vMath->getResult(0);
