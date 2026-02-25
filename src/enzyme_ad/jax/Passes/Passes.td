@@ -1131,7 +1131,9 @@ def CUDAToHierarchicalParallel : Pass<"cuda-to-hierarchical-parallel", "mlir::Mo
   ];
   let options = [
     Option<"regBitWidth", "reg-bit-width", "int", /*default=*/"256",
-           "Hardware register bit-width">
+           "Hardware register bit-width">,
+    Option<"unrollFactor", "unroll-factor", "int", /*default=*/"4", "Vector unroll factor">
+
   ];
 }
 
