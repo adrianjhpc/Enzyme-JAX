@@ -72,7 +72,6 @@ namespace {
 
       rewriter.mergeBlocks(op.getBody(), newLoop.getBody(), decodedIvs);
         
-      // Remove the old terminator from the merged block (it was the old scf.reduce/yield)
       rewriter.eraseOp(newLoop.getBody()->getTerminator()); 
 
       rewriter.replaceOp(op, newLoop.getResults());
@@ -90,12 +89,12 @@ namespace {
     int targetBitWidth;
 
     CUDAToVectorPattern(MLIRContext *context, int bitWidth)
-      : OpRewritePattern<scf::ParallelOp>(context), targetBitWidth(bitWidth) {}
+      : OpRewritePattern<scf::ParallelOp>(context) {
+      this->targetBitWidth = bitWidth; 
+    }
 
     LogicalResult matchAndRewrite(scf::ParallelOp op, PatternRewriter &rewriter) const override {
       if (op.getInductionVars().size() != 1) return failure();
-    
-      // Guard against re-vectorizing an already vectorized loop
       if (op->hasAttr("vectorized")) return failure();
 
       Location loc = op.getLoc();
@@ -109,18 +108,16 @@ namespace {
       }
       if (!elementType) elementType = rewriter.getF32Type();
 
-      unsigned bitWidth = elementType.getIntOrFloatBitWidth();
-      int64_t vWidth = targetBitWidth / bitWidth;
+      int64_t vWidth = targetBitWidth / elementType.getIntOrFloatBitWidth();
       if (vWidth <= 1) return failure();
 
       VectorType vType = VectorType::get({vWidth}, elementType);
       VectorType maskType = VectorType::get({vWidth}, rewriter.getI1Type());
     
-      // 1. Create New Loop with vectorized step
       Value vWidthConst = rewriter.create<arith::ConstantIndexOp>(loc, vWidth);
       auto newLoop = rewriter.create<scf::ParallelOp>(
 						      loc, op.getLowerBound(), op.getUpperBound(), ValueRange{vWidthConst}, op.getInitVals());
-      newLoop->setAttr("vectorized", rewriter.getUnitAttr()); // Prevent infinite recursion
+      newLoop->setAttr("vectorized", rewriter.getUnitAttr());
 
       Block *newBody = newLoop.getBody();
       rewriter.setInsertionPointToStart(newBody);
@@ -128,87 +125,88 @@ namespace {
       Value scalarIv = newLoop.getInductionVars()[0];
       Value ub = newLoop.getUpperBound()[0];
 
-      // 2. Setup Vector IV and Mask
+      IRMapping mapping;
+      mapping.map(op.getInductionVars()[0], scalarIv);
+
       Value baseIv = rewriter.create<arith::IndexCastOp>(loc, elementType, scalarIv);
       Value splatIv = rewriter.create<vector::BroadcastOp>(loc, vType, baseIv);
     
-      // Create [0, 1, 2... vWidth-1]
       SmallVector<Attribute> offsetAttrs;
       for (int64_t i = 0; i < vWidth; ++i) {
-        if (auto fType = dyn_cast<FloatType>(elementType)) offsetAttrs.push_back(FloatAttr::get(fType, (double)i));
-        else offsetAttrs.push_back(IntegerAttr::get(elementType, (int64_t)i));
+        if (auto fType = llvm::dyn_cast<FloatType>(elementType)) 
+	  offsetAttrs.push_back(FloatAttr::get(fType, (double)i));
+        else 
+	  offsetAttrs.push_back(IntegerAttr::get(elementType, i));
       }
       Value offsets = rewriter.create<arith::ConstantOp>(loc, DenseElementsAttr::get(vType, offsetAttrs));
-      Value vectorIv = isa<FloatType>(elementType) ? 
+      Value vectorIv = llvm::isa<FloatType>(elementType) ? 
         rewriter.create<arith::AddFOp>(loc, splatIv, offsets).getResult() :
         rewriter.create<arith::AddIOp>(loc, splatIv, offsets).getResult();
-
-      IRMapping mapping;
-      mapping.map(op.getInductionVars()[0], vectorIv);
 
       Value diff = rewriter.create<arith::SubIOp>(loc, ub, scalarIv);
       Value mask = rewriter.create<vector::CreateMaskOp>(loc, maskType, diff);
       Value zeroPadding = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(elementType));
 
-      // 3. Robust Cloning Loop
       for (Operation &innerOp : op.getBody()->getOperations()) {
         if (innerOp.hasTrait<OpTrait::IsTerminator>()) continue;
 
         if (auto load = dyn_cast<memref::LoadOp>(innerOp)) {
+	  SmallVector<Value> indices;
+	  for (Value idx : load.getIndices()) 
+	    indices.push_back(mapping.lookupOrDefault(idx));
+
 	  auto vRead = rewriter.create<vector::TransferReadOp>(
-							       loc, vType, mapping.lookupOrDefault(load.getMemref()), load.getIndices(),
+							       loc, vType, mapping.lookupOrDefault(load.getMemref()), indices,
 							       AffineMapAttr::get(rewriter.getMultiDimIdentityMap(1)),
 							       zeroPadding, mask, rewriter.getBoolArrayAttr({false}));
 	  mapping.map(load.getResult(), vRead.getResult());
         } 
         else if (auto store = dyn_cast<memref::StoreOp>(innerOp)) {
 	  Value vecVal = mapping.lookupOrDefault(store.getValueToStore());
-	  if (vecVal.getType() != vType) {
+	  if (vecVal.getType() != vType)
 	    vecVal = rewriter.create<vector::BroadcastOp>(loc, vType, vecVal);
-	  }
+
+	  SmallVector<Value> indices;
+	  for (Value idx : store.getIndices()) 
+	    indices.push_back(mapping.lookupOrDefault(idx));
+
 	  rewriter.create<vector::TransferWriteOp>(
-						   loc, vecVal, mapping.lookupOrDefault(store.getMemref()), store.getIndices(),
+						   loc, vecVal, mapping.lookupOrDefault(store.getMemref()), indices,
 						   AffineMapAttr::get(rewriter.getMultiDimIdentityMap(1)),
 						   mask, rewriter.getBoolArrayAttr({false}));
         }
-	else if (innerOp.getDialect()->getNamespace() == "arith" || 
-		 innerOp.getDialect()->getNamespace() == "math") {
-    
+        else if (innerOp.getDialect()->getNamespace() == "arith" || 
+                 innerOp.getDialect()->getNamespace() == "math") {
+            
 	  SmallVector<Value> vOperands;
 	  for (Value operand : innerOp.getOperands()) {
-	    Value mapped = mapping.lookupOrDefault(operand);
-        
-	    // If the mapped value is still a scalar (i.e., its type isn't a VectorType),
-	    // we must splat it to match the vector width of our new operation.
-	    if (!llvm::isa<VectorType>(mapped.getType())) {
-	      // This handles function args, loop-invariant constants, etc.
-	      mapped = rewriter.create<vector::BroadcastOp>(loc, vType, mapped);
+	    // If it's the IV, use the vectorIv we built
+	    if (operand == op.getInductionVars()[0]) {
+	      vOperands.push_back(vectorIv);
+	      continue;
 	    }
-	    vOperands.push_back(mapped);
+                
+	    Value v = mapping.lookupOrDefault(operand);
+	    if (!llvm::isa<VectorType>(v.getType()))
+	      v = rewriter.create<vector::BroadcastOp>(loc, vType, v);
+	    vOperands.push_back(v);
 	  }
 
 	  OperationState state(loc, innerOp.getName().getStringRef());
 	  state.addOperands(vOperands);
-    
-	  // We must ensure the result types are also converted to vectors
-	  for (Type t : innerOp.getResultTypes()) {
+	  for (Type t : innerOp.getResultTypes()) 
 	    state.addTypes(VectorType::get({vWidth}, t));
-	  }
 	  state.addAttributes(innerOp.getAttrs());
-    
-	  // rewriter.create will now trigger the folder safely because 
-	  // all operands are guaranteed to be vectors of the correct width.
+            
 	  Operation *vOp = rewriter.create(state);
-    
 	  for (unsigned i = 0; i < innerOp.getNumResults(); ++i)
 	    mapping.map(innerOp.getResult(i), vOp->getResult(i));
-	}
+        }
       }
 
       rewriter.replaceOp(op, newLoop.getResults());
       return success();
-    }
-     
+    } 
   };
   
   // =========================================================================
@@ -255,19 +253,14 @@ namespace {
     using Base::Base;
   
     void runOnOperation() override {
-      llvm::errs() << "RUNNING CUDA TO HIERARCHICAL PASS\n";
-
+      
       ModuleOp module = getOperation();
       MLIRContext *ctx = &getContext();
-
-      llvm::errs() << "RUNNING CUDA TO HIERARCHICAL PASS 0\n";
 
       assert(regBitWidth > 0 && "expected positive bit width for vectorisation");
       assert((regBitWidth & (regBitWidth - 1)) == 0 && "expected the bit width for vectorisation to be a power of 2");
 
       int finalWidth = (regBitWidth > 0) ? regBitWidth : 256; 
-
-      llvm::errs() << "RUNNING CUDA TO HIERARCHICAL PASS 1 " << finalWidth << "\n" ;
 
       if (auto attr = module->getAttrOfType<StringAttr>("llvm.target_features")) {
 	llvm::StringRef features = attr.getValue();
@@ -275,8 +268,6 @@ namespace {
 	else if (features.contains("+avx2") || features.contains("+avx")) finalWidth = 256;
 	else if (features.contains("+neon") || features.contains("+sse")) finalWidth = 128;
       }
-
-      llvm::errs() << "RUNNING CUDA TO HIERARCHICAL PASS 2\n";
 
       SmallVector<gpu::AllocOp> allocsToMove;
       module.walk([&](gpu::AllocOp alloc) {
@@ -294,21 +285,15 @@ namespace {
 	alloc.erase();
       }
 
-      llvm::errs() << "RUNNING CUDA TO HIERARCHICAL PASS 3\n";
- 
       // Flatten 2D/3D loops to 1D flat structures
       RewritePatternSet collapsePatterns(ctx);
       collapsePatterns.add<ParallelLoopCollapsePattern>(ctx);
       if (failed(applyPatternsGreedily(module, std::move(collapsePatterns)))) signalPassFailure();
 
-      llvm::errs() << "RUNNING CUDA TO HIERARCHICAL PASS 4\n";
-
       // Resolve Barriers by Fissioning the loops
       RewritePatternSet prePatterns(ctx);
       prePatterns.add<BarrierFissionPattern>(ctx);
       if (failed(applyPatternsGreedily(module, std::move(prePatterns)))) signalPassFailure();
-
-      llvm::errs() << "RUNNING CUDA TO HIERARCHICAL PASS 5\n";
 
       // Strip-Mine and Vectorise the Innermost loops
       RewritePatternSet patterns(ctx);
