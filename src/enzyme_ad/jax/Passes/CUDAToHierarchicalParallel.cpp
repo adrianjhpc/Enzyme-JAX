@@ -36,571 +36,273 @@ namespace {
   // Flattens N-Dimensional scf.parallel loops into a 1D loop.
   // This maps perfectly to linear CPU thread pools and linear SIMD vectors.
   // =========================================================================
-  struct ParallelLoopCollapsePattern : public OpRewritePattern<scf::ParallelOp> {
+struct ParallelLoopCollapsePattern : public OpRewritePattern<scf::ParallelOp> {
     using OpRewritePattern<scf::ParallelOp>::OpRewritePattern;
 
     LogicalResult matchAndRewrite(scf::ParallelOp op, PatternRewriter &rewriter) const override {
+        unsigned numDims = op.getInductionVars().size();
+        if (numDims <= 1) return failure();
 
-      unsigned numDims = op.getInductionVars().size();
-      if (numDims <= 1) return failure(); // Already 1D, nothing to do.
+        Location loc = op.getLoc();
+        Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+        Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
 
-      Location loc = op.getLoc();
-      Value one = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));
-      Value zero = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
+        Value totalSize = one;
+        SmallVector<Value> sizes;
 
-      Value totalSize = one;
-      SmallVector<Value> sizes;
-
-      // Calculate the total 1D size of the flattened iteration space
-      for (unsigned i = 0; i < numDims; ++i) {
-        Value lb = op.getLowerBound()[i];
-        Value ub = op.getUpperBound()[i];
-        Value step = op.getStep()[i];
-
-        // size[i] = (ub - lb + step - 1) / step
-        Value diff = rewriter.create<arith::SubIOp>(loc, ub, lb);
-        Value stepMinusOne = rewriter.create<arith::SubIOp>(loc, step, one);
-        Value diffPlus = rewriter.create<arith::AddIOp>(loc, diff, stepMinusOne);
-        Value size = rewriter.create<arith::DivUIOp>(loc, diffPlus, step);
-        
-        sizes.push_back(size);
-        totalSize = rewriter.create<arith::MulIOp>(loc, totalSize, size);
-      }
-
-      // Create the new 1D parallel loop
-      auto newLoop = rewriter.create<scf::ParallelOp>(
-          loc, ValueRange{zero}, ValueRange{totalSize}, ValueRange{one}, op.getInitVals());
-      
-      rewriter.setInsertionPointToStart(newLoop.getBody());
-      Value currentVal = newLoop.getInductionVars()[0];
-      SmallVector<Value> decodedIvs(numDims);
-
-      // Decode the 1D index back into 2D/3D indices for the loop body to use
-      for (int i = numDims - 1; i >= 0; --i) {
-        Value rem = rewriter.create<arith::RemUIOp>(loc, currentVal, sizes[i]);
-        Value scaled = rewriter.create<arith::MulIOp>(loc, rem, op.getStep()[i]);
-        decodedIvs[i] = rewriter.create<arith::AddIOp>(loc, op.getLowerBound()[i], scaled);
-        if (i > 0) {
-          currentVal = rewriter.create<arith::DivUIOp>(loc, currentVal, sizes[i]);
+        for (unsigned i = 0; i < numDims; ++i) {
+            Value diff = rewriter.create<arith::SubIOp>(loc, op.getUpperBound()[i], op.getLowerBound()[i]);
+            Value stepMinusOne = rewriter.create<arith::SubIOp>(loc, op.getStep()[i], one);
+            Value size = rewriter.create<arith::DivUIOp>(loc, rewriter.create<arith::AddIOp>(loc, diff, stepMinusOne), op.getStep()[i]);
+            sizes.push_back(size);
+            totalSize = rewriter.create<arith::MulIOp>(loc, totalSize, size);
         }
-      }
 
-      // Splice the old loop's body into the new loop
-      auto &oldBody = op.getBody()->getOperations();
-      auto &newBody = newLoop.getBody()->getOperations();
-      newBody.splice(std::prev(newBody.end()), oldBody, oldBody.begin(), std::prev(oldBody.end()));
+        auto newLoop = rewriter.create<scf::ParallelOp>(loc, zero, totalSize, one, op.getInitVals());
+        rewriter.setInsertionPointToStart(newLoop.getBody());
 
-      // Replace references to the old multi-dimensional indices with our decoded ones
-      for (unsigned i = 0; i < numDims; ++i) {
-        op.getInductionVars()[i].replaceAllUsesWith(decodedIvs[i]);
-      }
+        Value currentVal = newLoop.getInductionVars()[0];
+        SmallVector<Value> decodedIvs(numDims);
+        for (int i = numDims - 1; i >= 0; --i) {
+            Value rem = rewriter.create<arith::RemUIOp>(loc, currentVal, sizes[i]);
+            decodedIvs[i] = rewriter.create<arith::AddIOp>(loc, op.getLowerBound()[i], 
+                             rewriter.create<arith::MulIOp>(loc, rem, op.getStep()[i]));
+            if (i > 0) currentVal = rewriter.create<arith::DivUIOp>(loc, currentVal, sizes[i]);
+        }
 
-      rewriter.replaceOp(op, newLoop.getResults());
-      return success();
+        // Use rewriter.mergeBlocks instead of manual splice
+        rewriter.mergeBlocks(op.getBody(), newLoop.getBody(), decodedIvs);
+        
+        // Remove the old terminator from the merged block (it was the old scf.reduce/yield)
+        rewriter.eraseOp(newLoop.getBody()->getTerminator()); 
+
+        rewriter.replaceOp(op, newLoop.getResults());
+        return success();
     }
-  };
+};
 
 
   // =========================================================================
   // Pattern 2: Vectorisation & Strip-Mining
   // =========================================================================
   struct CUDAToVectorPattern : public OpRewritePattern<scf::ParallelOp> {
-    using OpRewritePattern<scf::ParallelOp>::OpRewritePattern;
-    
-    int targetBitWidth;
-    
-    CUDAToVectorPattern(MLIRContext *context, int bitWidth)
+  using OpRewritePattern<scf::ParallelOp>::OpRewritePattern;
+
+  int targetBitWidth;
+
+  CUDAToVectorPattern(MLIRContext *context, int bitWidth)
       : OpRewritePattern<scf::ParallelOp>(context), targetBitWidth(bitWidth) {}
-  
-    LogicalResult matchAndRewrite(scf::ParallelOp op, PatternRewriter &rewriter) const override {
 
-      // Strip-Mining / Hierarchical Partitioning
-      // We only vectorise innermost loops. 
-      // If a loop contains another loop, it represents the Grid (CPU Threads).
-      // We leave Grid loops untouched so they can map cleanly to OpenMP later.
-      bool hasNestedParallel = false;
-      op.walk([&](scf::ParallelOp nested) {
-        if (nested != op) hasNestedParallel = true;
-      });
-      if (hasNestedParallel) return failure();
+  LogicalResult matchAndRewrite(scf::ParallelOp op, PatternRewriter &rewriter) const override {
+    bool hasNestedParallel = false;
+    op.walk([&](scf::ParallelOp nested) { if (nested != op) hasNestedParallel = true; });
+    if (hasNestedParallel) return failure();
 
-      // Safety Check: Ensure it's a 1D parallel loop before splitting
-      if (op.getInductionVars().size() != 1) return failure();
-
-      auto loc = op.getLoc();
-      
-      // Dynamic Element Type Detection
-      Type elementType = rewriter.getF32Type(); // default fallback
-      for (auto &innerOp : *op.getBody()) {
-        if (auto load = dyn_cast<memref::LoadOp>(innerOp)) {
-          elementType = mlir::cast<MemRefType>(load.getMemref().getType()).getElementType();
-          break;
-        } else if (auto store = dyn_cast<memref::StoreOp>(innerOp)) {
-          elementType = mlir::cast<MemRefType>(store.getMemref().getType()).getElementType();
-          break;
-        }
-      }
-      
-      unsigned bitWidth = elementType.getIntOrFloatBitWidth();      
-      if (targetBitWidth % bitWidth != 0) {
-        return rewriter.notifyMatchFailure(op, "Incompatible register/element width");
-      }
-      if (targetBitWidth <= 0) return failure();
-      
-      unsigned vWidth = targetBitWidth / bitWidth;
-     
-      if (vWidth <= 1) {
-        return rewriter.notifyMatchFailure(op, "Vector width too small for vectorization");
-      }
-
-      VectorType vType = VectorType::get({vWidth}, elementType);
-      VectorType maskType = VectorType::get({vWidth}, rewriter.getI1Type());
-    
-      if (op.getStep().empty()) return failure();
-      Value scalarIv = op.getInductionVars()[0];
-      Value ub = op.getUpperBound()[0];
-    
-      // Update loop step to vWidth. 
-      // (This inherently enables threading on flat 1D loops via strip-mining)
-      rewriter.modifyOpInPlace(op, [&]() {
-        Value newStep = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(vWidth));
-        op.getStepMutable().assign(newStep);
-      });
-    
-      rewriter.setInsertionPointToStart(op.getBody());
-    
-      // Thread ID Vectorisation with Dynamic Types
-      Value baseThreadId;
-      if (isa<FloatType>(elementType)) {
-        Value intIv = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI32Type(), scalarIv);
-        baseThreadId = rewriter.create<arith::SIToFPOp>(loc, elementType, intIv);
-      } else {
-        baseThreadId = rewriter.create<arith::IndexCastOp>(loc, elementType, scalarIv);
-      }
-      Value splatIv = rewriter.create<vector::BroadcastOp>(loc, vType, baseThreadId).getResult();
-
-
-      SmallVector<Attribute, 8> offsetAttrs;
-      if (auto floatType = dyn_cast<FloatType>(elementType)) {
-        for (int64_t i = 0; i < vWidth; ++i) {
-          offsetAttrs.push_back(rewriter.getFloatAttr(floatType, (double)i));
-        }
-      } else if (auto intType = dyn_cast<IntegerType>(elementType)) {
-        for (int64_t i = 0; i < vWidth; ++i) {
-          offsetAttrs.push_back(rewriter.getIntegerAttr(intType, i));
-        }
-      }
-      auto offsetsAttr = DenseElementsAttr::get(vType, offsetAttrs);
-      
-      if (!offsetsAttr) return failure();
-      Value offsetsConst = rewriter.create<arith::ConstantOp>(loc, offsetsAttr);
-      
-      Value vectorisedThreadId;
-      if (isa<FloatType>(elementType)) {
-        vectorisedThreadId = rewriter.create<arith::AddFOp>(loc, splatIv, offsetsConst);
-      } else {
-        vectorisedThreadId = rewriter.create<arith::AddIOp>(loc, splatIv, offsetsConst);
-      }
-
-      DenseMap<Value, Value> vectorisedMapping;
-      vectorisedMapping[scalarIv] = vectorisedThreadId;
-    
-      auto mapAttr = AffineMapAttr::get(rewriter.getMultiDimIdentityMap(1));
-      auto inBoundsAttr = rewriter.getBoolArrayAttr({false});
-
-      Value diff = rewriter.create<arith::SubIOp>(loc, ub, scalarIv).getResult();
-      Value mask = rewriter.create<vector::CreateMaskOp>(loc, maskType, diff);
-
-      // Dynamic Zero Padding
-      Value zeroPadding;
-      if (auto floatType = dyn_cast<FloatType>(elementType)) {
-          zeroPadding = rewriter.create<arith::ConstantOp>(loc, rewriter.getFloatAttr(floatType, 0.0));
-      } else if (auto intType = dyn_cast<IntegerType>(elementType)) {
-          zeroPadding = rewriter.create<arith::ConstantOp>(loc, rewriter.getIntegerAttr(intType, 0));
-      }
-
-      auto getVecOp = [&](Value scalarVal) -> Value {
-        if (vectorisedMapping.count(scalarVal))
-          return vectorisedMapping[scalarVal];
-    
-        Type type = scalarVal.getType();
-    
-        // MLIR Vectors do not support 'index' elements.
-        // We must cast indices to a fixed-width integer (i64) before vectorizing.
-        if (type.isIndex()) {
-          OpBuilder::InsertionGuard guard(rewriter);
-          rewriter.setInsertionPointAfterValue(scalarVal);
-          scalarVal = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI64Type(), scalarVal);
-          type = rewriter.getI64Type();
-        } 
-
-        VectorType vType = VectorType::get({(int64_t)vWidth}, type);
-    
-        OpBuilder::InsertionGuard guard(rewriter);
-        rewriter.setInsertionPointAfterValue(scalarVal);
-        Value splat = rewriter.create<vector::BroadcastOp>(loc, vType, scalarVal).getResult();
-    
-        vectorisedMapping[scalarVal] = splat;
-        return splat;
-      };
-
-      // Transform the body
-      for (Operation &innerOp : llvm::make_early_inc_range(*op.getBody())) {
-        if (innerOp.hasTrait<OpTrait::IsTerminator>()) continue; 
-        // --- LOAD ---
-        if (auto load = dyn_cast<memref::LoadOp>(innerOp)) {
-          rewriter.setInsertionPoint(load);
-          SmallVector<Value, 4> indices(load.getIndices());
-          auto vRead = rewriter.create<vector::TransferReadOp>(
-                                       loc, vType, load.getMemref(), indices, mapAttr, zeroPadding, mask, inBoundsAttr);
-        
-          vectorisedMapping[load.getResult()] = vRead.getResult(); 
-          rewriter.replaceOp(load, vRead.getResult());
-        }
-
-// --- GPU THREAD ID ---
-        else if (auto threadId = dyn_cast<gpu::ThreadIdOp>(innerOp)) {
-          rewriter.setInsertionPoint(threadId);
-          if (threadId.getDimension() == gpu::Dimension::x) {
-            // Map threadIdx.x exactly to the inner loop's scalar induction variable.
-            // This provides the scalar base for memref indices, 
-            // and getVecOp() will automatically yield the SIMD vector for math!
-            rewriter.replaceOp(threadId, scalarIv);
-          } else {
-            // Y and Z dimensions are 0 (Since we flattened to 1D)
-            Value zero = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
-            rewriter.replaceOp(threadId, zero);
-          }
-        }
-        
-        // --- GPU BLOCK ID ---
-        else if (auto blockId = dyn_cast<gpu::BlockIdOp>(innerOp)) {
-          rewriter.setInsertionPoint(blockId);
-          if (blockId.getDimension() == gpu::Dimension::x) {
-            // Block ID is the induction variable of the OUTER loop
-            auto outerLoop = op->getParentOfType<scf::ParallelOp>();
-            if (outerLoop && !outerLoop.getInductionVars().empty()) {
-              Value bId = outerLoop.getInductionVars()[0];
-              rewriter.replaceOp(blockId, bId);
-            } else {
-              Value zero = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
-              rewriter.replaceOp(blockId, zero);
-            }
-          } else {
-            Value zero = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
-            rewriter.replaceOp(blockId, zero);
-          }
-        }
-
-        // --- GPU BLOCK DIMENSION ---
-        else if (auto blockDim = dyn_cast<gpu::BlockDimOp>(innerOp)) {
-          rewriter.setInsertionPoint(blockDim);
-          if (blockDim.getDimension() == gpu::Dimension::x) {
-            // Block dimension is exactly the inner loop's upper bound
-            rewriter.replaceOp(blockDim, ub);
-          } else {
-            Value one = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));
-            rewriter.replaceOp(blockDim, one);
-          }
-        }
-
-        // --- GPU GRID DIMENSION ---
-        else if (auto gridDim = dyn_cast<gpu::GridDimOp>(innerOp)) {
-          rewriter.setInsertionPoint(gridDim);
-          if (gridDim.getDimension() == gpu::Dimension::x) {
-            // Grid dimension is the upper bound of the OUTER loop
-            auto outerLoop = op->getParentOfType<scf::ParallelOp>();
-            if (outerLoop && !outerLoop.getUpperBound().empty()) {
-              Value gDim = outerLoop.getUpperBound()[0];
-              rewriter.replaceOp(gridDim, gDim);
-            } else {
-              Value one = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));
-              rewriter.replaceOp(gridDim, one);
-            }
-          } else {
-            Value one = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(1));
-            rewriter.replaceOp(gridDim, one);
-          }
-        }	
-      
-        // --- GENERIC ARITHMETIC HANDLER ---
-        else if (innerOp.getDialect()->getNamespace() == "arith") {
-          if (innerOp.getNumResults() == 1 && innerOp.getNumOperands() >= 1) {
-            rewriter.setInsertionPoint(&innerOp);
-            
-            SmallVector<Value, 2> vOperands;
-            for (auto [idx, operand] : llvm::enumerate(innerOp.getOperands())) {
-              Value vOp = getVecOp(operand);
-              
-              if (idx == 1 && mlir::isa<arith::DivFOp, arith::DivSIOp, arith::DivUIOp>(innerOp)) {
-                 Type opElemType = mlir::cast<VectorType>(vOp.getType()).getElementType();
-                 Value safeScalar;
-                 if (auto fType = dyn_cast<FloatType>(opElemType)) {
-                     safeScalar = rewriter.create<arith::ConstantOp>(loc, rewriter.getFloatAttr(fType, 1.0));
-                 } else if (auto iType = dyn_cast<IntegerType>(opElemType)) {
-                     safeScalar = rewriter.create<arith::ConstantOp>(loc, rewriter.getIntegerAttr(iType, 1));
-                 }
-                 
-                 VectorType vSafePadType = VectorType::get({vWidth}, opElemType);
-                 Value vSafePad = rewriter.create<vector::BroadcastOp>(loc, vSafePadType, safeScalar);
-                 vOp = rewriter.create<arith::SelectOp>(loc, mask, vOp, vSafePad).getResult();
-              }
-              vOperands.push_back(vOp);
-            }
-            
-            Type scalarRetType = innerOp.getResult(0).getType();
-            VectorType vRetType = VectorType::get({vWidth}, scalarRetType);
-            
-            OperationState state(loc, innerOp.getName().getStringRef());
-            state.addOperands(vOperands);
-            state.addTypes(vRetType);
-            state.addAttributes(innerOp.getAttrs());
-            
-            Operation *vOp = rewriter.create(state);
-            vectorisedMapping[innerOp.getResult(0)] = vOp->getResult(0);
-            rewriter.replaceOp(&innerOp, vOp->getResults());
-            continue;
-          }
-        }
-
-        // --- MATH OPERATIONS ---
-        else if (mlir::isa<math::ExpOp, math::SqrtOp, math::RsqrtOp, math::TanhOp, math::ErfOp, math::SinOp, math::CosOp, math::LogOp, math::PowFOp>(innerOp)) {
-          rewriter.setInsertionPoint(&innerOp);
-        
-          Value scalarInput = innerOp.getOperand(0);
-          Value vInput = getVecOp(scalarInput);
-        
-          Type opElemType = mlir::cast<VectorType>(vInput.getType()).getElementType();
-          Value safeScalarPad;
-          
-          if (mlir::isa<math::LogOp, math::SqrtOp>(innerOp)) {
-            safeScalarPad = rewriter.create<arith::ConstantOp>(loc, rewriter.getFloatAttr(mlir::cast<FloatType>(opElemType), 1.0));
-          } else {
-            safeScalarPad = rewriter.create<arith::ConstantOp>(loc, rewriter.getFloatAttr(mlir::cast<FloatType>(opElemType), 0.0));
-          }
-          
-          VectorType vSafePadType = VectorType::get({vWidth}, opElemType);
-          Value vSafePad = rewriter.create<vector::BroadcastOp>(loc, vSafePadType, safeScalarPad);
-          Value safeInput = rewriter.create<arith::SelectOp>(loc, mask, vInput, vSafePad).getResult();
- 
-          Operation *vMath = nullptr;
-          if (mlir::isa<math::ExpOp>(innerOp))       vMath = rewriter.create<math::ExpOp>(loc, safeInput);
-          else if (mlir::isa<math::SinOp>(innerOp))  vMath = rewriter.create<math::SinOp>(loc, safeInput);
-          else if (mlir::isa<math::CosOp>(innerOp))  vMath = rewriter.create<math::CosOp>(loc, safeInput);
-          else if (mlir::isa<math::TanhOp>(innerOp)) vMath = rewriter.create<math::TanhOp>(loc, safeInput);
-          else if (mlir::isa<math::LogOp>(innerOp))  vMath = rewriter.create<math::LogOp>(loc, safeInput);
-          else if (mlir::isa<math::SqrtOp>(innerOp)) vMath = rewriter.create<math::SqrtOp>(loc, safeInput);
-          else if (mlir::isa<math::RsqrtOp>(innerOp)) vMath = rewriter.create<math::RsqrtOp>(loc, safeInput);
-          else if (mlir::isa<math::ErfOp>(innerOp))   vMath = rewriter.create<math::ErfOp>(loc, safeInput);
-          else if (mlir::isa<math::PowFOp>(innerOp)) {
-            auto powf = dyn_cast<math::PowFOp>(innerOp);
-            Value scalarExp = powf.getOperand(1);
-            Value vExp = getVecOp(scalarExp);
-        
-            Value safeScalarPadPow = rewriter.create<arith::ConstantOp>(loc, rewriter.getFloatAttr(mlir::cast<FloatType>(opElemType), 1.0));
-            Value vSafePadPow = rewriter.create<vector::BroadcastOp>(loc, vSafePadType, safeScalarPadPow).getResult();
-          
-            Value safeBase = rewriter.create<arith::SelectOp>(loc, mask, vInput, vSafePadPow).getResult();
-            Value safeExp = rewriter.create<arith::SelectOp>(loc, mask, vExp, vSafePadPow).getResult();
-        
-            auto vPowf = rewriter.create<math::PowFOp>(loc, safeBase, safeExp);
-            vectorisedMapping[powf.getResult()] = vPowf.getResult();
-            rewriter.replaceOp(powf, vPowf.getResult());
-            continue;
-          }
-
-          if (vMath) {
-            vectorisedMapping[innerOp.getResult(0)] = vMath->getResult(0);
-            rewriter.replaceOp(&innerOp, vMath->getResults());
-          }
-        }       
-        
-        // --- SHUFFLE ---
-        else if (auto shfl = dyn_cast<gpu::ShuffleOp>(innerOp)) {
-          rewriter.setInsertionPoint(shfl);
-          Value vInput = getVecOp(shfl.getValue());
-          auto constOp = shfl.getOffset().getDefiningOp<arith::ConstantIntOp>();
-          if (!constOp) return rewriter.notifyMatchFailure(shfl, "Dynamic shuffle offset not supported");
-          uint32_t delta = constOp.value();
-        
-          if (shfl.getMode() == gpu::ShuffleMode::DOWN) {
-            SmallVector<int64_t> shuffleMask;
-            for (int64_t i = 0; i < vWidth; ++i) shuffleMask.push_back(std::min<int64_t>(i + delta, vWidth - 1));
-            auto vShfl = rewriter.create<vector::ShuffleOp>(loc, vInput, vInput, shuffleMask);
-            vectorisedMapping[shfl.getResult(0)] = vShfl.getResult();
-            rewriter.replaceOp(shfl, vShfl.getResult());
-          } else if (shfl.getMode() == gpu::ShuffleMode::XOR) {
-            SmallVector<int64_t> xorMask;
-            for (int64_t i = 0; i < vWidth; ++i) xorMask.push_back(i ^ delta);
-            auto vShfl = rewriter.create<vector::ShuffleOp>(loc, vInput, vInput, xorMask);
-            vectorisedMapping[shfl.getResult(0)] = vShfl.getResult();
-            rewriter.replaceOp(shfl, vShfl.getResult());
-          }
-        }
-
-        // --- SUBGROUP / WARP REDUCTION ---
-        else if (auto sgReduce = dyn_cast<gpu::SubgroupReduceOp>(innerOp)) {
-          rewriter.setInsertionPoint(sgReduce);
-          Value vInput = getVecOp(sgReduce.getValue());
-          
-          vector::CombiningKind kind;
-          switch (sgReduce.getOp()) {
-            case gpu::AllReduceOperation::ADD: kind = vector::CombiningKind::ADD; break;
-            case gpu::AllReduceOperation::MUL: kind = vector::CombiningKind::MUL; break;
-            case gpu::AllReduceOperation::MINNUMF: kind = vector::CombiningKind::MINNUMF; break;
-            case gpu::AllReduceOperation::MAXNUMF: kind = vector::CombiningKind::MAXNUMF; break;
-            case gpu::AllReduceOperation::MINSI: kind = vector::CombiningKind::MINSI; break;
-            case gpu::AllReduceOperation::MAXSI: kind = vector::CombiningKind::MAXSI; break;
-            case gpu::AllReduceOperation::MINUI: kind = vector::CombiningKind::MINUI; break;
-            case gpu::AllReduceOperation::MAXUI: kind = vector::CombiningKind::MAXUI; break;
-            case gpu::AllReduceOperation::AND: kind = vector::CombiningKind::AND; break;
-            case gpu::AllReduceOperation::OR:  kind = vector::CombiningKind::OR; break;
-            case gpu::AllReduceOperation::XOR: kind = vector::CombiningKind::XOR; break;
-            default: return rewriter.notifyMatchFailure(sgReduce, "Unsupported reduction kind");
-          }
-          
-          Value scalarReduction = rewriter.create<vector::ReductionOp>(loc, kind, vInput).getResult();
-          Value vBroadcastBack = rewriter.create<vector::BroadcastOp>(loc, vType, scalarReduction).getResult();
-          
-          vectorisedMapping[sgReduce.getResult()] = vBroadcastBack;
-          rewriter.replaceOp(sgReduce, vBroadcastBack);
-        }
-
-        // --- STORE ---
-        else if (auto store = dyn_cast<memref::StoreOp>(innerOp)) {
-          rewriter.setInsertionPoint(store);
-          Value vVal = getVecOp(store.getValueToStore());
-          SmallVector<Value, 4> indices(store.getIndices());
-        
-          rewriter.create<vector::TransferWriteOp>(
-                               loc, vVal, store.getMemref(), indices, mapAttr, mask, inBoundsAttr);
-          rewriter.eraseOp(store);
-        }
-      
-        // --- ATOMIC ADD ---
-        else if (auto atomic = dyn_cast<memref::AtomicRMWOp>(innerOp)) {
-          rewriter.setInsertionPoint(atomic);
-          Value vVal = getVecOp(atomic.getValue());
-
-          bool isUniformAddress = true;
-          for (Value idx : atomic.getIndices()) {
-            if (vectorisedMapping.count(idx)) {
-              isUniformAddress = false;
-              break;
-            }
-          }
-
-          if (isUniformAddress) {
-            Value neutralElement = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(vType));
-            Value maskedVal = rewriter.create<arith::SelectOp>(loc, mask, vVal, neutralElement).getResult();
-            auto reduction = rewriter.create<vector::ReductionOp>(loc, vector::CombiningKind::ADD, maskedVal);
-            rewriter.create<memref::AtomicRMWOp>(loc, atomic.getKind(), reduction.getResult(), atomic.getMemref(), atomic.getIndices());
-
-          } else {
-            SmallVector<Value, 4> vIndices;
-            for (Value idx : atomic.getIndices()) vIndices.push_back(getVecOp(idx));
-
-            for (int64_t i = 0; i < vWidth; ++i) {
-              Value laneMask = rewriter.create<vector::ExtractOp>(loc, mask, ArrayRef<int64_t>{i}).getResult();
-              
-              rewriter.create<scf::IfOp>(loc, laneMask, [&](OpBuilder &b, Location l) {
-                Value laneVal = b.create<vector::ExtractOp>(l, vVal, ArrayRef<int64_t>{i}).getResult();
-                SmallVector<Value, 4> laneIndices;
-                for (Value vIdx : vIndices) {
-                  laneIndices.push_back(b.create<vector::ExtractOp>(l, vIdx, ArrayRef<int64_t>{i}).getResult());
-                }
-                b.create<memref::AtomicRMWOp>(l, atomic.getKind(), laneVal, atomic.getMemref(), laneIndices);
-                b.create<scf::YieldOp>(l);
-              });
-            }
-          }
-          rewriter.eraseOp(atomic);
-        }
-      }
-      return success();
+    if (op.getInductionVars().size() != 1) return failure();
+    // Guard: Prevent re-vectorising (Step > 1)
+    if (auto constStep = op.getStep()[0].getDefiningOp<arith::ConstantIndexOp>()) {
+      if (constStep.value() > 1) return failure();
     }
-  };
- 
+
+    auto loc = op.getLoc();
+Type elementType = nullptr;
+
+for (auto &innerOp : *op.getBody()) {
+    if (auto load = dyn_cast<memref::LoadOp>(innerOp)) {
+        if (auto mType = dyn_cast<MemRefType>(load.getMemref().getType()))
+            elementType = mType.getElementType();
+    } else if (auto store = dyn_cast<memref::StoreOp>(innerOp)) {
+        if (auto mType = dyn_cast<MemRefType>(store.getMemref().getType()))
+            elementType = mType.getElementType();
+    }
+    if (elementType) break;
+}
+
+// Fallback if no loads/stores found
+if (!elementType) elementType = rewriter.getF32Type();
+
+unsigned bitWidth = elementType.getIntOrFloatBitWidth();
+if (bitWidth == 0 || targetBitWidth % bitWidth != 0) {
+    return rewriter.notifyMatchFailure(op, "Invalid element bitwidth");
+}
+
+int64_t vWidth = targetBitWidth / bitWidth;
+if (vWidth <= 1) return failure();
+
+    VectorType vType = VectorType::get({(int64_t)vWidth}, elementType);
+    VectorType maskType = VectorType::get({(int64_t)vWidth}, rewriter.getI1Type());
+
+    // Create the new vectorised parallel loop
+    Value newStep = rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(vWidth));
+      rewriter.modifyOpInPlace(op, [&]() {
+      op.getStepMutable().assign(newStep);
+    });
+
+    auto newLoop = rewriter.create<scf::ParallelOp>(
+        loc, op.getLowerBound(), op.getUpperBound(), ValueRange{newStep}, op.getInitVals());
+
+    // Move insertion point to the new loop body
+    rewriter.setInsertionPointToStart(newLoop.getBody());
+    Value scalarIv = newLoop.getInductionVars()[0];
+    Value ub = newLoop.getUpperBound()[0];
+
+    // Thread ID Vectorisation
+    Value baseThreadId;
+    if (isa<FloatType>(elementType)) {
+      Value intIv = rewriter.create<arith::IndexCastOp>(loc, rewriter.getI32Type(), scalarIv);
+      baseThreadId = rewriter.create<arith::SIToFPOp>(loc, elementType, intIv);
+    } else {
+      baseThreadId = rewriter.create<arith::IndexCastOp>(loc, elementType, scalarIv);
+    }
+    Value splatIv = rewriter.create<vector::BroadcastOp>(loc, vType, baseThreadId);
+
+    SmallVector<Attribute> offsetAttrs;
+for (int64_t i = 0; i < vWidth; ++i) {
+    if (auto floatType = dyn_cast<FloatType>(elementType)) {
+        offsetAttrs.push_back(rewriter.getFloatAttr(floatType, (double)i));
+    } else {
+        offsetAttrs.push_back(rewriter.getIntegerAttr(elementType, i));
+    }
+}
+    Value offsetsConst = rewriter.create<arith::ConstantOp>(loc, DenseElementsAttr::get(vType, offsetAttrs));
+    Value vectorisedThreadId = isa<FloatType>(elementType) ? 
+        rewriter.create<arith::AddFOp>(loc, splatIv, offsetsConst).getResult() :
+        rewriter.create<arith::AddIOp>(loc, splatIv, offsetsConst).getResult();
+
+    // Mapping from OLD values to new vectorised values
+    DenseMap<Value, Value> vectorisedMapping;
+    vectorisedMapping[op.getInductionVars()[0]] = vectorisedThreadId;
+
+    Value diff = rewriter.create<arith::SubIOp>(loc, ub, scalarIv);
+    Value mask = rewriter.create<vector::CreateMaskOp>(loc, maskType, diff);
+    Value zeroPadding = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(elementType));
+
+    // Helper to get vectorised version of an operand
+   auto getVecOp = [&](Value scalarVal, Operation *contextOp) -> Value {
+    if (vectorisedMapping.count(scalarVal)) {
+        Value v = vectorisedMapping[scalarVal];
+        if (v) return v;
+    }
+
+    // Context-aware insertion
+    OpBuilder::InsertionGuard guard(rewriter);
+    if (Operation *defOp = scalarVal.getDefiningOp()) {
+        rewriter.setInsertionPointAfter(defOp);
+    } else {
+        rewriter.setInsertionPoint(contextOp);
+    }
+
+    Type type = scalarVal.getType();
+    Value toSplat = scalarVal;
+    if (type.isIndex()) {
+        toSplat = rewriter.create<arith::IndexCastOp>(contextOp->getLoc(), rewriter.getI64Type(), scalarVal);
+        type = rewriter.getI64Type();
+    }
+
+    VectorType splatVType = VectorType::get({vWidth}, type);
+    Value splat = rewriter.create<vector::BroadcastOp>(contextOp->getLoc(), splatVType, toSplat);
+    
+    vectorisedMapping[scalarVal] = splat;
+    return splat;
+};
+
+
+    // Build the new body by iterating the old one (WITHOUT replacing ops yet)
+    for (Operation &innerOp : op.getBody()->getOperations()) {
+      if (innerOp.hasTrait<OpTrait::IsTerminator>()) continue;
+
+      if (auto load = dyn_cast<memref::LoadOp>(innerOp)) {
+        auto vRead = rewriter.create<vector::TransferReadOp>(
+            loc, vType, load.getMemref(), load.getIndices(),
+            AffineMapAttr::get(rewriter.getMultiDimIdentityMap(1)),
+            zeroPadding, mask, rewriter.getBoolArrayAttr({false}));
+        vectorisedMapping[load.getResult()] = vRead.getResult();
+      } 
+    else if (auto store = dyn_cast<memref::StoreOp>(innerOp)) {
+    rewriter.setInsertionPoint(store);
+
+    Value vVal = getVecOp(store.getValueToStore(), &innerOp);
+    if (!vVal) return failure();
+
+    rewriter.create<vector::TransferWriteOp>(
+        loc, vVal, store.getMemref(), store.getIndices(),
+        AffineMapAttr::get(rewriter.getMultiDimIdentityMap(1)),
+        mask, rewriter.getBoolArrayAttr({false}));
+
+    rewriter.eraseOp(store);
+}
+      else if (innerOp.getDialect()->getNamespace() == "arith") {
+    // Only handle simple mapping of scalar-to-vector ops
+    if (innerOp.getNumResults() == 1) {
+        rewriter.setInsertionPoint(&innerOp);
+        
+        SmallVector<Value, 2> vOperands;
+for (Value operand : innerOp.getOperands()) {
+    // Pass &innerOp so the helper knows WHERE to create the broadcast
+    Value vOp = getVecOp(operand, &innerOp); 
+    if (!vOp) return failure();
+    vOperands.push_back(vOp);
+}
+        Type scalarRetType = innerOp.getResult(0).getType();
+        VectorType vRetType = VectorType::get({(int64_t)vWidth}, scalarRetType);
+
+        OperationState state(innerOp.getLoc(), innerOp.getName().getStringRef());
+        state.addOperands(vOperands);
+        state.addTypes(vRetType);
+        state.addAttributes(innerOp.getAttrs());
+
+        Operation *vOp = rewriter.create(state);
+        
+        vectorisedMapping[innerOp.getResult(0)] = vOp->getResult(0);
+        
+        rewriter.replaceOp(&innerOp, vOp->getResults());
+        continue;
+    }
+}
+    }
+
+    rewriter.replaceOp(op, newLoop.getResults());
+    return success();
+  }
+};
+  
+  
   // =========================================================================
   // Pattern 3: Barrier Fission
   // =========================================================================
-  struct BarrierFissionPattern : public OpRewritePattern<scf::ParallelOp> {
+struct BarrierFissionPattern : public OpRewritePattern<scf::ParallelOp> {
     using OpRewritePattern<scf::ParallelOp>::OpRewritePattern;
 
     LogicalResult matchAndRewrite(scf::ParallelOp parallelOp, PatternRewriter &rewriter) const override {
-      gpu::BarrierOp barrier;
-      for (auto &op : *parallelOp.getBody()) {
-        if (auto b = dyn_cast<gpu::BarrierOp>(&op)) {
-          barrier = b;
-          break;
+        gpu::BarrierOp barrier;
+        for (auto &op : *parallelOp.getBody()) {
+            if (auto b = dyn_cast<gpu::BarrierOp>(&op)) { barrier = b; break; }
         }
-      }
-      if (!barrier) return failure(); 
+        if (!barrier) return failure();
 
-      Location loc = parallelOp.getLoc();
-      Value ub = parallelOp.getUpperBound()[0];
-      Value iv1 = parallelOp.getInductionVars()[0];
-
-      SmallVector<Value> crossBarrierValues;
-      for (Operation *op = &parallelOp.getBody()->front(); op != barrier.getOperation(); op = op->getNextNode()) {
-        for (Value result : op->getResults()) {
-          bool usedAfter = false;
-          for (Operation *user : result.getUsers()) {
-            if (barrier->isBeforeInBlock(user)) {
-              usedAfter = true;
-              break;
-            }
-          }
-          if (usedAfter) crossBarrierValues.push_back(result);
-        }
-      }
-
-      rewriter.setInsertionPoint(parallelOp);
-      DenseMap<Value, Value> allocations;
-      for (Value val : crossBarrierValues) {
-        MemRefType allocType = MemRefType::get({ShapedType::kDynamic}, val.getType());
-        Value alloc = rewriter.create<memref::AllocaOp>(loc, allocType, ub);
-        allocations[val] = alloc;
-      }
-
-      rewriter.setInsertionPointAfter(parallelOp);
-      auto secondLoop = rewriter.create<scf::ParallelOp>(loc, parallelOp.getLowerBound(), parallelOp.getUpperBound(), parallelOp.getStep());
-      Value iv2 = secondLoop.getInductionVars()[0];
-
-      rewriter.setInsertionPoint(barrier);
-      for (Value val : crossBarrierValues) {
-        rewriter.create<memref::StoreOp>(loc, val, allocations[val], ValueRange{iv1});
-      }
-
-      rewriter.setInsertionPointToStart(secondLoop.getBody());
-      DenseMap<Value, Value> loads;
-      for (Value val : crossBarrierValues) {
-        loads[val] = rewriter.create<memref::LoadOp>(loc, allocations[val], ValueRange{iv2}).getResult();
-      }
-
-      Operation *curr = barrier->getNextNode();
-      Operation *end = &parallelOp.getBody()->back(); 
-      while (curr != end) {
-        Operation *next = curr->getNextNode();
-        curr->moveBefore(secondLoop.getBody()->getTerminator());
+        rewriter.setInsertionPointAfter(parallelOp);
+        auto secondLoop = cast<scf::ParallelOp>(rewriter.clone(*parallelOp.getOperation()));
         
-        curr->walk([&](Operation *nestedOp) {
-          for (OpOperand &operand : nestedOp->getOpOperands()) {
-            if (loads.count(operand.get())) {
-              operand.set(loads[operand.get()]);
-            } else if (operand.get() == iv1) {
-              operand.set(iv2); 
+        bool found = false;
+        for (Operation &inner : llvm::make_early_inc_range(*parallelOp.getBody())) {
+            if (&inner == barrier.getOperation()) { found = true; rewriter.eraseOp(&inner); continue; }
+            if (found && !inner.hasTrait<OpTrait::IsTerminator>()) rewriter.eraseOp(&inner);
+        }
+
+        found = false;
+        rewriter.setInsertionPointToStart(secondLoop.getBody());
+        for (Operation &inner : llvm::make_early_inc_range(*secondLoop.getBody())) {
+            if (auto b = dyn_cast<gpu::BarrierOp>(inner)) {
+                found = true;
+                rewriter.eraseOp(b);
+                continue;
             }
-          }
-        });
-        curr = next;
-      }
+            if (!found && !inner.hasTrait<OpTrait::IsTerminator>()) rewriter.eraseOp(&inner);
+        }
 
-      rewriter.eraseOp(barrier);
-      return success();
+        return success();
     }
-  };
-
+};
 
   // =========================================================================
   // Pass Runner
