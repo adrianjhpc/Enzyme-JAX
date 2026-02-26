@@ -70,6 +70,27 @@ cc_binary(
     ]),
 )
 
+cc_binary(
+    name = "enzyme-cgeist",
+    srcs = ["//src/enzyme_ad/tools:enzyme-cgeist.cpp"],
+    deps = [
+        "//src/enzyme_ad/jax:RegistryUtils",
+        "@llvm-project//mlir:IR",
+        "@llvm-project//mlir:Parser",
+        "@llvm-project//mlir:Pass",
+        "@llvm-project//mlir:GPUDialect",
+        "@llvm-project//mlir:GPUTransforms", 
+        "@llvm-project//mlir:AffineDialect",
+        "@llvm-project//mlir:AffineTransforms",
+        "@llvm-project//mlir:SCFDialect",
+        "@llvm-project//mlir:ArithDialect",
+        "@llvm-project//mlir:FuncDialect",
+        "@llvm-project//mlir:MemRefDialect",
+        "@llvm-project//mlir:AffineToStandard",
+        "@llvm-project//llvm:Support",
+    ],
+)
+
 cc_library(
     name = "RaiseLib",
     srcs = [
