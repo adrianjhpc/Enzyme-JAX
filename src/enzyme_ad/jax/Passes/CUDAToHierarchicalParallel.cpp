@@ -213,6 +213,11 @@ namespace {
       int64_t totalStep = vWidth * targetUnrollFactor;
       Value stepConst = rewriter.create<arith::ConstantIndexOp>(loc, totalStep);
 
+      if (totalStep <= 0) {
+	llvm::errs() << "Error: totalStep is " << totalStep << ". Aborting to prevent hang.\n";
+	return failure();
+      }
+
       vector::CombiningKind redKind = vector::CombiningKind::ADD;
       if (op.getNumReductions() > 0) {
 	auto reduceOps = op.getBody()->getOps<scf::ReduceOp>();
@@ -225,10 +230,10 @@ namespace {
 	  }
 	}
       }
-     
+    
       SmallVector<Value> vectorInits;
       for (auto [i, t] : llvm::enumerate(op.getResultTypes())) {
-        TypedAttr identityAttr; // Change to TypedAttr
+        TypedAttr identityAttr;
        
         if (redKind == vector::CombiningKind::MUL) {
           if (llvm::isa<FloatType>(t))
@@ -241,7 +246,6 @@ namespace {
           else
             identityAttr = cast<TypedAttr>(rewriter.getIntegerAttr(t, std::numeric_limits<int64_t>::min()));
         } else {
-          // getZeroAttr already returns a TypedAttr
           identityAttr = cast<TypedAttr>(rewriter.getZeroAttr(t));
         }
 
@@ -253,7 +257,6 @@ namespace {
       newLoop->setAttr("vectorized", rewriter.getUnitAttr());
 
       Block *loopBody = newLoop.getBody();
-      rewriter.eraseOp(loopBody->getTerminator());
       rewriter.setInsertionPointToStart(loopBody);
 
       Value zeroIdx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
@@ -280,7 +283,6 @@ namespace {
                 if (!llvm::isa<VectorType>(val.getType()))
                   val = rewriter.create<vector::BroadcastOp>(loc, vType, val);
                 
-                // --- FIX: Accumulate with correct op ---
                 if (llvm::isa<FloatType>(elementType)) {
 		  if (redKind == vector::CombiningKind::MUL)
 		    partialSums[i] = rewriter.create<arith::MulFOp>(loc, partialSums[i], val);
@@ -332,7 +334,45 @@ namespace {
       }
 
       rewriter.setInsertionPointToEnd(loopBody);
-      rewriter.create<scf::ReduceOp>(loc, partialSums);
+      rewriter.eraseOp(loopBody->getTerminator());
+
+      auto reduceOp = rewriter.create<scf::ReduceOp>(loc, partialSums);
+
+      for (auto [i, region] : llvm::enumerate(reduceOp.getRegions())) {
+        // scf.reduce regions come with a block and two arguments (lhs, rhs)
+        Block &redBlock = region->front();
+        rewriter.setInsertionPointToStart(&redBlock);
+        
+        Value lhs = redBlock.getArgument(0);
+        Value rhs = redBlock.getArgument(1);
+        Value combined;
+
+        // Use the same reduction kind detected at the start of the pattern
+        if (llvm::isa<FloatType>(elementType)) {
+          switch (redKind) {
+	  case vector::CombiningKind::MUL: 
+	    combined = rewriter.create<arith::MulFOp>(loc, lhs, rhs); break;
+	  case vector::CombiningKind::MAXSI: 
+	    combined = rewriter.create<arith::MaximumFOp>(loc, lhs, rhs); break;
+	  case vector::CombiningKind::MINSI: 
+	    combined = rewriter.create<arith::MinimumFOp>(loc, lhs, rhs); break;
+	  default: 
+	    combined = rewriter.create<arith::AddFOp>(loc, lhs, rhs); break;
+          }
+        } else {
+          switch (redKind) {
+	  case vector::CombiningKind::MUL: 
+	    combined = rewriter.create<arith::MulIOp>(loc, lhs, rhs); break;
+	  case vector::CombiningKind::MAXSI: 
+	    combined = rewriter.create<arith::MaxSIOp>(loc, lhs, rhs); break;
+	  case vector::CombiningKind::MINSI: 
+	    combined = rewriter.create<arith::MinSIOp>(loc, lhs, rhs); break;
+	  default: 
+	    combined = rewriter.create<arith::AddIOp>(loc, lhs, rhs); break;
+          }
+        }
+        rewriter.create<scf::ReduceReturnOp>(loc, combined);
+      }
 
       rewriter.setInsertionPointAfter(newLoop);
       if (newLoop.getNumResults() > 0) {
@@ -383,25 +423,25 @@ namespace {
       }
 
       RewritePatternSet vectorPatterns(ctx);
-    vectorPatterns.add<CUDAToVectorPattern>(ctx, finalWidth, finalUnrollFactor);
-    FrozenRewritePatternSet frozenVectorPatterns(std::move(vectorPatterns));
+      vectorPatterns.add<CUDAToVectorPattern>(ctx, finalWidth, finalUnrollFactor);
+      FrozenRewritePatternSet frozenVectorPatterns(std::move(vectorPatterns));
 
-    // Gather loops first to avoid "iterator invalidation" or seeing new loops
-    SmallVector<scf::ParallelOp> leafLoops;
-    module.walk([&](scf::ParallelOp op) {
+      // Gather loops first to avoid "iterator invalidation" or seeing new loops
+      SmallVector<scf::ParallelOp> leafLoops;
+      module.walk([&](scf::ParallelOp op) {
         if (!op->hasAttr("vectorized") && !op->hasAttr("tiled")) {
-            bool hasNested = false;
-            op.getRegion().walk([&](scf::ParallelOp nested) {
-                if (nested != op) hasNested = true;
-            });
-            if (!hasNested) leafLoops.push_back(op);
+	  bool hasNested = false;
+	  op.getRegion().walk([&](scf::ParallelOp nested) {
+	    if (nested != op) hasNested = true;
+	  });
+	  if (!hasNested) leafLoops.push_back(op);
         }
-    });
+      });
 
-    for (auto op : leafLoops) {
+      for (auto op : leafLoops) {
         // Wrap the single op in a brace-init list to satisfy the ArrayRef requirement
         (void)applyOpPatternsAndFold({op.getOperation()}, frozenVectorPatterns);
-    }
+      }
     }
     
   };
