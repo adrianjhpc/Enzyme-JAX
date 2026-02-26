@@ -1132,8 +1132,8 @@ def CUDAToHierarchicalParallel : Pass<"cuda-to-hierarchical-parallel", "mlir::Mo
   let options = [
     Option<"regBitWidth", "reg-bit-width", "int", /*default=*/"256",
            "Hardware register bit-width">,
-    Option<"unrollFactor", "unroll-factor", "int", /*default=*/"4", "Vector unroll factor">
-
+    Option<"unrollFactor", "unroll-factor", "int", /*default=*/"4", "Vector unroll factor">,
+    Option<"maxThreads", "max-threads", "int", /*default=*/"32", "Maximum threads for parallelisation">    
   ];
 }
 

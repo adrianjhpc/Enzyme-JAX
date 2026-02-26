@@ -86,30 +86,57 @@ namespace {
   struct ParallelLoopTilingPattern : public OpRewritePattern<scf::ParallelOp> {
     using OpRewritePattern<scf::ParallelOp>::OpRewritePattern;
 
+    int targetMaxThreads;
+    int targetBitWidth;
+    int targetUnrollFactor;
+    
+    ParallelLoopTilingPattern(MLIRContext *context, int bitWidth, int unrollFactor, int maxThreads)
+      : OpRewritePattern<scf::ParallelOp>(context),
+	targetBitWidth(bitWidth), targetUnrollFactor(unrollFactor),
+        targetMaxThreads(maxThreads) {}
+
+    
     LogicalResult matchAndRewrite(scf::ParallelOp op, PatternRewriter &rewriter) const override {
       if (op->hasAttr("tiled") || op->hasAttr("vectorized")) return failure();
         
       Location loc = op.getLoc();
-      Value tileSize = rewriter.create<arith::ConstantIndexOp>(loc, 1024);
+      Value ub = op.getUpperBound()[0];
+      Value lb = op.getLowerBound()[0];
+      Value totalIters = rewriter.create<arith::SubIOp>(loc, ub, lb);
+      Value numThreads = rewriter.create<arith::ConstantIndexOp>(loc, maxTheads);
+      Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+      Value temp = rewriter.create<arith::AddIOp>(loc, totalIters, rewriter.create<arith::SubIOp>(loc, numThreads, one));
+
+      Value threadChunk = rewriter.create<arith::DivUIOp>(loc, totalIters, numThreads);
+      int64_t vectorFloorBytes = bitWidth * unrollFactor;
+      Value vectorFloor = rewriter.create<arith::ConstantIndexOp>(loc, vectorFloorBytes);
+      // Clamp the tile size so we don't get vector lengths too short in the vectorisation pass
+      Value tileSize = rewriter.create<arith::MaxSIOp>(loc, threadChunk, vectorFloor);          
+      
+      // Create Outer Loop
+      auto tiledLoop = rewriter.create<scf::ParallelOp>(loc, op.getLowerBound(), op.getUpperBound(), ValueRange{tileSize}, op.getInitVals());
         
-      auto tiledLoop = rewriter.create<scf::ParallelOp>(
-							loc, op.getLowerBound(), op.getUpperBound(), ValueRange{tileSize}, op.getInitVals());
+      // Clear the auto-generated terminator in the outer loop
+      rewriter.eraseOp(tiledLoop.getBody()->getTerminator());
         
       rewriter.setInsertionPointToStart(tiledLoop.getBody());
         
       Value iv = tiledLoop.getInductionVars()[0];
-      Value upper = rewriter.create<arith::MinUIOp>(loc, 
-						    rewriter.create<arith::AddIOp>(loc, iv, tileSize), op.getUpperBound()[0]);
+      Value upper = rewriter.create<arith::MinUIOp>(loc, rewriter.create<arith::AddIOp>(loc, iv, tileSize), op.getUpperBound()[0]); 
         
-      auto innerLoop = rewriter.create<scf::ParallelOp>(
-							loc, ValueRange{iv}, ValueRange{upper}, op.getStep(), tiledLoop.getRegionIterArgs());
+      // Create Inner Loop
+      auto innerLoop = rewriter.create<scf::ParallelOp>(loc, ValueRange{iv}, ValueRange{upper}, op.getStep(), tiledLoop.getRegionIterArgs());
         
+      // Clear the auto-generated terminator in the inner loop 
+      rewriter.eraseOp(innerLoop.getBody()->getTerminator());
+
       innerLoop->setAttr("tiled", rewriter.getUnitAttr());
       tiledLoop->setAttr("tiled", rewriter.getUnitAttr());
 
+      // Merge original body into inner loop
       rewriter.mergeBlocks(op.getBody(), innerLoop.getBody(), innerLoop.getInductionVars());
         
-      // Ensure inner loop results are reduced into the outer loop
+      // Create the reduction for the outer loop
       rewriter.setInsertionPointToEnd(tiledLoop.getBody());
       rewriter.create<scf::ReduceOp>(loc, innerLoop.getResults());
 
@@ -158,7 +185,6 @@ namespace {
   // =========================================================================
   // Pattern 4: Vectorisation with Unrolling
   // =========================================================================
-
   struct CUDAToVectorPattern : public OpRewritePattern<scf::ParallelOp> {
     using OpRewritePattern<scf::ParallelOp>::OpRewritePattern;
 
@@ -167,12 +193,10 @@ namespace {
 
     CUDAToVectorPattern(MLIRContext *context, int bitWidth, int unrollFactor)
       : OpRewritePattern<scf::ParallelOp>(context), 
-        targetBitWidth(bitWidth), 
-        targetUnrollFactor(unrollFactor) {}
+        targetBitWidth(bitWidth), targetUnrollFactor(unrollFactor) {}
 
-    // Helper to map Arith Atomic kinds to Vector Reduction kinds
-    static std::optional<vector::CombiningKind> getReductionKind(arith::AtomicRMWKind gpuKind) {
-      switch (gpuKind) {
+    static std::optional<vector::CombiningKind> getReductionKind(arith::AtomicRMWKind kind) {
+      switch (kind) {
       case arith::AtomicRMWKind::addf:
       case arith::AtomicRMWKind::addi:   return vector::CombiningKind::ADD;
       case arith::AtomicRMWKind::mulf:
@@ -186,23 +210,29 @@ namespace {
       case arith::AtomicRMWKind::xori:   return vector::CombiningKind::XOR;
       default: return std::nullopt;
       }
-    }    
+    }
 
     LogicalResult matchAndRewrite(scf::ParallelOp op, PatternRewriter &rewriter) const override {
-      if (op.getInductionVars().size() != 1 || op->hasAttr("vectorized")) 
-        return failure();
+      if (op->hasAttr("vectorized")) return failure();
+    
+      // Tiling Check: Only vectorize the innermost loop
+      bool containsParallel = false;
+      op.getRegion().walk([&](scf::ParallelOp nested) {
+	if (nested != op) containsParallel = true;
+      });
+      if (containsParallel) return failure();
 
       Location loc = op.getLoc();
+    
+      // Discover Element Type
       Type elementType = nullptr;
       for (auto &innerOp : *op.getBody()) {
-        if (auto load = dyn_cast<memref::LoadOp>(innerOp)) 
-          elementType = cast<MemRefType>(load.getMemref().getType()).getElementType();
-        else if (auto store = dyn_cast<memref::StoreOp>(innerOp))
-          elementType = cast<MemRefType>(store.getMemref().getType()).getElementType();
-        if (elementType) break;
+	if (auto load = dyn_cast<memref::LoadOp>(innerOp)) 
+	  elementType = cast<MemRefType>(load.getMemref().getType()).getElementType();
+	if (elementType) break;
       }
       if (!elementType) elementType = rewriter.getF32Type();
-
+    
       int64_t vWidth = targetBitWidth / elementType.getIntOrFloatBitWidth();
       if (vWidth <= 1) return failure();
 
@@ -211,139 +241,108 @@ namespace {
       int64_t totalStep = vWidth * targetUnrollFactor;
       Value stepConst = rewriter.create<arith::ConstantIndexOp>(loc, totalStep);
 
+      // Initialize Vector Accumulators
       SmallVector<Value> vectorInits;
       for (Type t : op.getResultTypes()) {
-        Value zero = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(t));
-        vectorInits.push_back(rewriter.create<vector::BroadcastOp>(loc, VectorType::get({vWidth}, t), zero));
+	Value zero = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(t));
+	vectorInits.push_back(rewriter.create<vector::BroadcastOp>(loc, VectorType::get({vWidth}, t), zero).getResult());
       }
 
       auto newLoop = rewriter.create<scf::ParallelOp>(loc, op.getLowerBound(), op.getUpperBound(), ValueRange{stepConst}, vectorInits);
       newLoop->setAttr("vectorized", rewriter.getUnitAttr());
 
       Block *loopBody = newLoop.getBody();
-      Operation *emptyTerminator = loopBody->getTerminator();
-      rewriter.setInsertionPoint(emptyTerminator);
+      rewriter.eraseOp(loopBody->getTerminator());
+      rewriter.setInsertionPointToStart(loopBody);
 
-      Value loopIv = newLoop.getInductionVars()[0];
-      Value ub = newLoop.getUpperBound()[0];
-      Value zeroPadding = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(elementType));
       Value zeroIdx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      Value ub = newLoop.getUpperBound()[0];
+      Value cstZero = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(elementType));
       SmallVector<Value> partialSums(newLoop.getRegionIterArgs().begin(), newLoop.getRegionIterArgs().end());
-
-      SmallVector<Attribute> offsetAttrs;
-      for (int64_t i = 0; i < vWidth; ++i) {
-        if (auto fType = llvm::dyn_cast<FloatType>(elementType)) 
-          offsetAttrs.push_back(FloatAttr::get(fType, (double)i));
-        else 
-          offsetAttrs.push_back(IntegerAttr::get(elementType, i));
-      }
-      Value baseOffsets = rewriter.create<arith::ConstantOp>(loc, DenseElementsAttr::get(vType, offsetAttrs));
+      auto identityMap = AffineMapAttr::get(rewriter.getMultiDimIdentityMap(1));
 
       for (int u = 0; u < targetUnrollFactor; ++u) {
-        IRMapping mapping;
-        Value unrollOffset = rewriter.create<arith::ConstantIndexOp>(loc, u * vWidth);
-        Value currentScalarIv = rewriter.create<arith::AddIOp>(loc, loopIv, unrollOffset);
-        mapping.map(op.getInductionVars()[0], currentScalarIv);
+	IRMapping mapping;
+	Value offset = rewriter.create<arith::ConstantIndexOp>(loc, u * vWidth);
+	Value iv = rewriter.create<arith::AddIOp>(loc, newLoop.getInductionVars()[0], offset);
+	mapping.map(op.getInductionVars()[0], iv);
 
-        Value baseIvIdx = rewriter.create<arith::IndexCastOp>(loc, elementType, currentScalarIv);
-        Value splatIv = rewriter.create<vector::BroadcastOp>(loc, vType, baseIvIdx);
-        Value currentVectorIv = llvm::isa<FloatType>(elementType) ? 
-	  rewriter.create<arith::AddFOp>(loc, splatIv, baseOffsets).getResult() :
-	  rewriter.create<arith::AddIOp>(loc, splatIv, baseOffsets).getResult();
+	Value diff = rewriter.create<arith::SubIOp>(loc, ub, iv);
+	Value clamped = rewriter.create<arith::MaxSIOp>(loc, diff, zeroIdx);
+	Value mask = rewriter.create<vector::CreateMaskOp>(loc, maskType, clamped);
 
-        Value diff = rewriter.create<arith::SubIOp>(loc, ub, currentScalarIv);
-        Value clampedDiff = rewriter.create<arith::MaxSIOp>(loc, zeroIdx, diff);
-        Value mask = rewriter.create<vector::CreateMaskOp>(loc, maskType, clampedDiff);
-
-        for (Operation &innerOp : op.getBody()->getOperations()) {
-          if (innerOp.hasTrait<OpTrait::IsTerminator>()) {
-            if (auto reduceOp = dyn_cast<scf::ReduceOp>(innerOp)) {
-              for (auto [i, operand] : llvm::enumerate(reduceOp.getOperands())) {
-                Value val = mapping.lookupOrDefault(operand);
-                if (!llvm::isa<VectorType>(val.getType())) // FIXED: llvm::isa
-                  val = rewriter.create<vector::BroadcastOp>(loc, vType, val);
+	for (Operation &innerOp : op.getBody()->getOperations()) {
+	  if (innerOp.hasTrait<OpTrait::IsTerminator>()) {
+	    if (auto reduceOp = dyn_cast<scf::ReduceOp>(innerOp)) {
+	      for (auto [i, operand] : llvm::enumerate(reduceOp.getOperands())) {
+		Value val = mapping.lookupOrDefault(operand);
+		if (!llvm::isa<VectorType>(val.getType()))
+		  val = rewriter.create<vector::BroadcastOp>(loc, vType, val).getResult();
+              
 		partialSums[i] = llvm::isa<FloatType>(elementType) ? 
-		  rewriter.create<arith::AddFOp>(loc, partialSums[i], val).getResult() : 
-		  rewriter.create<arith::AddIOp>(loc, partialSums[i], val).getResult();
-              }
-            }
-            continue;
-          }
+                  rewriter.create<arith::AddFOp>(loc, partialSums[i], val).getResult() : 
+                  rewriter.create<arith::AddIOp>(loc, partialSums[i], val).getResult();
+	      }
+	    }
+	    continue;
+	  }
 
-          if (auto load = dyn_cast<memref::LoadOp>(innerOp)) {
-            SmallVector<Value> indices;
-            for (Value idx : load.getIndices()) indices.push_back(mapping.lookupOrDefault(idx));
-            mapping.map(load.getResult(), rewriter.create<vector::TransferReadOp>(loc, vType, mapping.lookupOrDefault(load.getMemref()), indices, AffineMapAttr::get(rewriter.getMultiDimIdentityMap(1)), zeroPadding, mask, rewriter.getBoolArrayAttr({false})).getResult());
-          } 
-          else if (auto store = dyn_cast<memref::StoreOp>(innerOp)) {
-            Value vecVal = mapping.lookupOrDefault(store.getValueToStore());
-            if (!llvm::isa<VectorType>(vecVal.getType())) vecVal = rewriter.create<vector::BroadcastOp>(loc, vType, vecVal);
-            SmallVector<Value> indices;
-            for (Value idx : store.getIndices()) indices.push_back(mapping.lookupOrDefault(idx));
-            rewriter.create<vector::TransferWriteOp>(loc, vecVal, mapping.lookupOrDefault(store.getMemref()), indices, AffineMapAttr::get(rewriter.getMultiDimIdentityMap(1)), mask, rewriter.getBoolArrayAttr({false}));
-          }
+	  if (auto load = dyn_cast<memref::LoadOp>(innerOp)) {
+	    SmallVector<Value> idxs;
+	    for (auto i : load.getIndices()) idxs.push_back(mapping.lookupOrDefault(i));
+	    mapping.map(load.getResult(), rewriter.create<vector::TransferReadOp>(
+										  loc, vType, mapping.lookupOrDefault(load.getMemref()), idxs, 
+										  identityMap, cstZero, mask, rewriter.getBoolArrayAttr({false})).getResult());
+	  } 
+	  else if (auto store = dyn_cast<memref::StoreOp>(innerOp)) {
+	    Value val = mapping.lookupOrDefault(store.getValueToStore());
+	    if (!llvm::isa<VectorType>(val.getType())) 
+	      val = rewriter.create<vector::BroadcastOp>(loc, vType, val).getResult();
+	    SmallVector<Value> idxs;
+	    for (auto i : store.getIndices()) idxs.push_back(mapping.lookupOrDefault(i));
+	    rewriter.create<vector::TransferWriteOp>(
+						     loc, val, mapping.lookupOrDefault(store.getMemref()), idxs, 
+						     identityMap, mask, rewriter.getBoolArrayAttr({false}));
+	  }
 	  else if (auto memAtomic = llvm::dyn_cast<memref::AtomicRMWOp>(innerOp)) {
 	    Value valToProcess = mapping.lookupOrDefault(memAtomic.getValue());
-	    Value scalarVal;
-    
-	    if (llvm::isa<VectorType>(valToProcess.getType())) {
-	      auto vKind = getReductionKind(memAtomic.getKind());
-	      if (vKind) {
-		scalarVal = rewriter.create<vector::ReductionOp>(loc, *vKind, valToProcess);
-	      } else {
-
-		scalarVal = rewriter.create<vector::ExtractOp>(loc, valToProcess, ArrayRef<int64_t>{0});
-	      }
-	    } else {
-	      scalarVal = valToProcess;
-	    }
-    
-	    SmallVector<Value> indices;
-	    for (Value idx : memAtomic.getIndices())
-	      indices.push_back(mapping.lookupOrDefault(idx));
-	    rewriter.create<memref::AtomicRMWOp>(loc, memAtomic.getKind(), scalarVal, mapping.lookupOrDefault(memAtomic.getMemref()), indices);
+	    Value scalarVal = llvm::isa<VectorType>(valToProcess.getType()) ? 
+              rewriter.create<vector::ReductionOp>(loc, *getReductionKind(memAtomic.getKind()), valToProcess).getResult() : 
+              valToProcess;
+	    SmallVector<Value> idxs;
+	    for (auto i : memAtomic.getIndices()) idxs.push_back(mapping.lookupOrDefault(i));
+	    rewriter.create<memref::AtomicRMWOp>(loc, memAtomic.getKind(), scalarVal, mapping.lookupOrDefault(memAtomic.getMemref()), idxs);
 	  }
-          else if (innerOp.getDialect()->getNamespace() == "arith" || innerOp.getDialect()->getNamespace() == "math") {
-
-            
-            SmallVector<Value> vOperands;
-            for (Value operand : innerOp.getOperands()) {
-	      Value v = (operand == op.getInductionVars()[0]) ? currentVectorIv : mapping.lookupOrDefault(operand);
-	      if (!llvm::isa<VectorType>(v.getType())) v = rewriter.create<vector::BroadcastOp>(loc, vType, v);
-	      vOperands.push_back(v);
-            }
-            OperationState state(loc, innerOp.getName().getStringRef());
-            state.addOperands(vOperands);
-            for (Type t : innerOp.getResultTypes()) state.addTypes(VectorType::get({vWidth}, t));
-            state.addAttributes(innerOp.getAttrs());
-            Operation *vOp = rewriter.create(state);
-            for (unsigned i = 0; i < innerOp.getNumResults(); ++i) mapping.map(innerOp.getResult(i), vOp->getResult(i));
-          }
-        }
+	  else if (innerOp.getDialect()->getNamespace() == "arith" || innerOp.getDialect()->getNamespace() == "math") {
+	    SmallVector<Value> ops;
+	    for (auto o : innerOp.getOperands()) {
+	      Value v = (o == op.getInductionVars()[0]) ? iv : mapping.lookupOrDefault(o);
+	      if (!llvm::isa<VectorType>(v.getType())) v = rewriter.create<vector::BroadcastOp>(loc, vType, v).getResult();
+	      ops.push_back(v);
+	    }
+	    OperationState state(loc, innerOp.getName().getStringRef());
+	    state.addOperands(ops);
+	    for (Type t : innerOp.getResultTypes()) state.addTypes(VectorType::get({vWidth}, t));
+	    state.addAttributes(innerOp.getAttrs());
+	    Operation *vOp = rewriter.create(state);
+	    for (unsigned i = 0; i < innerOp.getNumResults(); ++i) mapping.map(innerOp.getResult(i), vOp->getResult(i));
+	  }
+	}
       }
 
-      rewriter.setInsertionPoint(emptyTerminator);
-      
+      rewriter.setInsertionPointToEnd(loopBody);
       rewriter.create<scf::ReduceOp>(loc, partialSums);
-      
-      rewriter.eraseOp(emptyTerminator);
 
-      // Post-loop Horizontal Reductions (only if there are results)
       rewriter.setInsertionPointAfter(newLoop);
       if (newLoop.getNumResults() > 0) {
-          SmallVector<Value> scalarResults;
-          for (Value vRes : newLoop.getResults()) {
-              // Standard horizontal add reduction
-              scalarResults.push_back(
-                  rewriter.create<vector::ReductionOp>(loc, vector::CombiningKind::ADD, vRes).getResult()
-              );
-          }
-          rewriter.replaceOp(op, scalarResults);
+	SmallVector<Value> scalarResults;
+	for (Value vRes : newLoop.getResults()) {
+	  scalarResults.push_back(rewriter.create<vector::ReductionOp>(loc, vector::CombiningKind::ADD, vRes).getResult());
+	}
+	rewriter.replaceOp(op, scalarResults);
       } else {
-          // If the loop returns nothing, just erase the old loop
-          rewriter.eraseOp(op);
-      }     
-      
+	rewriter.eraseOp(op);
+      }
       return success();
     }
   };
@@ -363,7 +362,7 @@ namespace {
       assert((regBitWidth & (regBitWidth - 1)) == 0 && "expected the bit width for vectorisation to be a power of 2");
 
       assert(unrollFactor > 0 && "expected positive unroll factor for vectorisation");
-
+      assert(maxThreads > 0 && "expected positive max threads value for the thread parallelisation functionality");
 
       int finalWidth = (regBitWidth > 0) ? regBitWidth : 256; 
       int finalUnrollFactor = (unrollFactor > 0) ? unrollFactor : 4;
@@ -396,12 +395,12 @@ namespace {
       RewritePatternSet collapsePatterns(ctx);
       collapsePatterns.add<ParallelLoopCollapsePattern>(ctx);
       (void)applyPatternsGreedily(module, std::move(collapsePatterns));
-      /*
+      
       // Tile for Threads (Hierarchical Level 1)
       RewritePatternSet tilePatterns(ctx);
-      tilePatterns.add<ParallelLoopTilingPattern>(ctx);
+      tilePatterns.add<ParallelLoopTilingPattern>(ctx, finalWidth, finalUnrollFactor, maxThreads);
       (void)applyPatternsGreedily(module, std::move(tilePatterns));
-      */
+      
       // Resolve Barriers by Fissioning the loops
       RewritePatternSet prePatterns(ctx);
       prePatterns.add<BarrierFissionPattern>(ctx);
