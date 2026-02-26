@@ -98,19 +98,40 @@ namespace {
     
     LogicalResult matchAndRewrite(scf::ParallelOp op, PatternRewriter &rewriter) const override {
       if (op->hasAttr("tiled") || op->hasAttr("vectorized")) return failure();
-        
+
       Location loc = op.getLoc();
       Value ub = op.getUpperBound()[0];
       Value lb = op.getLowerBound()[0];
       Value totalIters = rewriter.create<arith::SubIOp>(loc, ub, lb);
       Value numThreads = rewriter.create<arith::ConstantIndexOp>(loc, targetMaxThreads);
 
-      Value threadChunk = rewriter.create<arith::DivUIOp>(loc, totalIters, numThreads);
-      int64_t vectorFloorBytes = targetBitWidth * targetUnrollFactor;
-      Value vectorFloor = rewriter.create<arith::ConstantIndexOp>(loc, vectorFloorBytes);
-      // Clamp the tile size so we don't get vector lengths too short in the vectorisation pass
-      Value tileSize = rewriter.create<arith::MaxSIOp>(loc, threadChunk, vectorFloor);          
+      // Calculate the chunk size for threads (Ceiling division: (total + n - 1) / n)
+      Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+      Value threadChunk = rewriter.create<arith::DivUIOp>(loc, rewriter.create<arith::AddIOp>(loc, totalIters,  
+							  rewriter.create<arith::SubIOp>(loc, numThreads, one)),numThreads);
       
+      // Discover Element Type
+      Type elementType = nullptr;
+      for (auto &innerOp : *op.getBody()) {
+	if (auto load = dyn_cast<memref::LoadOp>(innerOp)) 
+	  elementType = cast<MemRefType>(load.getMemref().getType()).getElementType();
+	if (elementType) break;
+      }
+      if (!elementType) elementType = rewriter.getF32Type();
+    
+      unsigned elementBits = targetBitWidth / elementType.getIntOrFloatBitWidth();
+      if (elementBits <= 1) return failure();
+      
+      // Lanes = Register Bits / Element Bits (e.g., 256 / 32 = 8 lanes)
+      int64_t lanes = targetBitWidth / elementBits;
+      int64_t vectorFloorElements = lanes * targetUnrollFactor; // e.g., 8 * 4 = 32
+
+      Value vectorFloor = rewriter.create<arith::ConstantIndexOp>(loc, vectorFloorElements);
+      
+      // This ensures that even if we have 1000 threads, we won't give them 
+      // fewer than 32 elements each, preserving SIMD efficiency.
+      Value tileSize = rewriter.create<arith::MaxSIOp>(loc, threadChunk, vectorFloor);
+            
       // Create Outer Loop
       auto tiledLoop = rewriter.create<scf::ParallelOp>(loc, op.getLowerBound(), op.getUpperBound(), ValueRange{tileSize}, op.getInitVals());
         
