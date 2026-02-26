@@ -364,22 +364,38 @@ namespace {
         alloc.erase();
       }
 
-      RewritePatternSet collapsePatterns(ctx);
-      collapsePatterns.add<ParallelLoopCollapsePattern>(ctx);
-      (void)applyPatternsGreedily(module, std::move(collapsePatterns));
-      
-      RewritePatternSet tilePatterns(ctx);
-      tilePatterns.add<ParallelLoopTilingPattern>(ctx, finalWidth, finalUnrollFactor, maxThreads);
-      (void)applyPatternsGreedily(module, std::move(tilePatterns));
-      
-      RewritePatternSet prePatterns(ctx);
-      prePatterns.add<BarrierFissionPattern>(ctx);
-      (void)applyPatternsGreedily(module, std::move(prePatterns));
-      
-      RewritePatternSet patterns(ctx);
-      patterns.add<CUDAToVectorPattern>(ctx, finalWidth, finalUnrollFactor);
-      (void)applyPatternsGreedily(module, std::move(patterns));
-    }
-  };
+
+      RewritePatternSet structuralPatterns(ctx);
+      structuralPatterns.add<ParallelLoopCollapsePattern>(ctx);
+      structuralPatterns.add<ParallelLoopTilingPattern>(ctx, finalWidth, finalUnrollFactor, maxThreads);
+      structuralPatterns.add<BarrierFissionPattern>(ctx);
+      (void)applyPatternsGreedily(module, std::move(structuralPatterns));
     
+      // Vectorization Phase (Manual Walk to prevent hanging)
+      // We create the pattern set but apply it explicitly.
+      RewritePatternSet vectorPatterns(ctx);
+      vectorPatterns.add<CUDAToVectorPattern>(ctx, finalWidth, finalUnrollFactor);
+    
+      // We freeze the patterns for better performance and API compatibility
+      FrozenRewritePatternSet frozenVectorPatterns(std::move(vectorPatterns));
+
+      module.walk([&](scf::ParallelOp op) {
+	// Only target loops that are not already marked
+	if (!op->hasAttr("tiled") && !op->hasAttr("vectorized")) {
+	  bool hasNestedParallel = false;
+	  op.getRegion().walk([&](scf::ParallelOp nested) {
+	    if (nested != op) hasNestedParallel = true;
+	  });
+	  
+	  // If it's a leaf loop, apply patterns only to this operation
+	  if (!hasNestedParallel) {
+          // applyPatternsGreedily can take a list of ops to restrict its scope
+	    (void)applyPatternsGreedily(op, frozenVectorPatterns);
+	  }
+	}
+      });      
+    }
+    
+  };
+  
 }
