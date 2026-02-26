@@ -218,7 +218,7 @@ namespace {
 	auto reduceOps = op.getBody()->getOps<scf::ReduceOp>();
 	if (!reduceOps.empty()) {
 	  scf::ReduceOp firstReduce = *reduceOps.begin();
-	  Block &redBlock = firstReduce.getRegion().front();
+	  Block &redBlock = firstReduce.getRegion(0).front();
 	  if (!redBlock.empty() && !redBlock.front().hasTrait<OpTrait::IsTerminator>()) {
             if (auto kind = getReductionKindFromOp(&redBlock.front()))
 	      redKind = *kind;
