@@ -154,10 +154,11 @@ namespace {
       return success();
     }
   };
-  
+
   // =========================================================================
-  // Pattern 4: Vectorisation and Strip-Mining
+  // Pattern 4: Vectorisation with Unrolling
   // =========================================================================
+
   struct CUDAToVectorPattern : public OpRewritePattern<scf::ParallelOp> {
     using OpRewritePattern<scf::ParallelOp>::OpRewritePattern;
 
@@ -169,14 +170,29 @@ namespace {
         targetBitWidth(bitWidth), 
         targetUnrollFactor(unrollFactor) {}
 
+    // Helper to map Arith Atomic kinds to Vector Reduction kinds
+    static std::optional<vector::CombiningKind> getReductionKind(arith::AtomicRMWKind gpuKind) {
+      switch (gpuKind) {
+      case arith::AtomicRMWKind::addf:
+      case arith::AtomicRMWKind::addi:   return vector::CombiningKind::ADD;
+      case arith::AtomicRMWKind::mulf:
+      case arith::AtomicRMWKind::muli:   return vector::CombiningKind::MUL;
+      case arith::AtomicRMWKind::minu:   return vector::CombiningKind::MINUI;
+      case arith::AtomicRMWKind::mins:   return vector::CombiningKind::MINSI;
+      case arith::AtomicRMWKind::maxu:   return vector::CombiningKind::MAXUI;
+      case arith::AtomicRMWKind::maxs:   return vector::CombiningKind::MAXSI;
+      case arith::AtomicRMWKind::andi:   return vector::CombiningKind::AND;
+      case arith::AtomicRMWKind::ori:    return vector::CombiningKind::OR;
+      case arith::AtomicRMWKind::xori:   return vector::CombiningKind::XOR;
+      default: return std::nullopt;
+      }
+    }    
+
     LogicalResult matchAndRewrite(scf::ParallelOp op, PatternRewriter &rewriter) const override {
-      // Only target 1D loops that haven't been vectorized yet
       if (op.getInductionVars().size() != 1 || op->hasAttr("vectorized")) 
         return failure();
 
       Location loc = op.getLoc();
-      
-      // Determine Element Type (defaults to f32 if not found)
       Type elementType = nullptr;
       for (auto &innerOp : *op.getBody()) {
         if (auto load = dyn_cast<memref::LoadOp>(innerOp)) 
@@ -187,39 +203,33 @@ namespace {
       }
       if (!elementType) elementType = rewriter.getF32Type();
 
-      // Calculate Vector Width
       int64_t vWidth = targetBitWidth / elementType.getIntOrFloatBitWidth();
       if (vWidth <= 1) return failure();
 
       VectorType vType = VectorType::get({vWidth}, elementType);
       VectorType maskType = VectorType::get({vWidth}, rewriter.getI1Type());
-      
-      // Step = (Vector Width * Unroll Factor)
       int64_t totalStep = vWidth * targetUnrollFactor;
       Value stepConst = rewriter.create<arith::ConstantIndexOp>(loc, totalStep);
 
-      // Initialize Vector Accumulators for Reductions
-      // We start with "neutral" vectors (e.g., all zeros for addition)
       SmallVector<Value> vectorInits;
       for (Type t : op.getResultTypes()) {
         Value zero = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(t));
         vectorInits.push_back(rewriter.create<vector::BroadcastOp>(loc, VectorType::get({vWidth}, t), zero));
       }
 
-      // Create the new vectorised parallel loop
-      auto newLoop = rewriter.create<scf::ParallelOp>(
-          loc, op.getLowerBound(), op.getUpperBound(), ValueRange{stepConst}, vectorInits);
+      auto newLoop = rewriter.create<scf::ParallelOp>(loc, op.getLowerBound(), op.getUpperBound(), ValueRange{stepConst}, vectorInits);
       newLoop->setAttr("vectorized", rewriter.getUnitAttr());
 
-      rewriter.setInsertionPointToStart(newLoop.getBody());
+      Block *loopBody = newLoop.getBody();
+      Operation *emptyTerminator = loopBody->getTerminator();
+      rewriter.setInsertionPoint(emptyTerminator);
+
       Value loopIv = newLoop.getInductionVars()[0];
       Value ub = newLoop.getUpperBound()[0];
       Value zeroPadding = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(elementType));
-
-      // Iteration arguments for reductions
+      Value zeroIdx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
       SmallVector<Value> partialSums(newLoop.getRegionIterArgs().begin(), newLoop.getRegionIterArgs().end());
 
-      // Base vector offsets: [0, 1, 2, ... vWidth-1]
       SmallVector<Attribute> offsetAttrs;
       for (int64_t i = 0; i < vWidth; ++i) {
         if (auto fType = llvm::dyn_cast<FloatType>(elementType)) 
@@ -229,40 +239,32 @@ namespace {
       }
       Value baseOffsets = rewriter.create<arith::ConstantOp>(loc, DenseElementsAttr::get(vType, offsetAttrs));
 
-      // Unroll Loop Body
       for (int u = 0; u < targetUnrollFactor; ++u) {
         IRMapping mapping;
-        
         Value unrollOffset = rewriter.create<arith::ConstantIndexOp>(loc, u * vWidth);
         Value currentScalarIv = rewriter.create<arith::AddIOp>(loc, loopIv, unrollOffset);
         mapping.map(op.getInductionVars()[0], currentScalarIv);
 
-        // Vector IV for math inside the loop
         Value baseIvIdx = rewriter.create<arith::IndexCastOp>(loc, elementType, currentScalarIv);
         Value splatIv = rewriter.create<vector::BroadcastOp>(loc, vType, baseIvIdx);
         Value currentVectorIv = llvm::isa<FloatType>(elementType) ? 
-            rewriter.create<arith::AddFOp>(loc, splatIv, baseOffsets).getResult() :
-            rewriter.create<arith::AddIOp>(loc, splatIv, baseOffsets).getResult();
+	  rewriter.create<arith::AddFOp>(loc, splatIv, baseOffsets).getResult() :
+	  rewriter.create<arith::AddIOp>(loc, splatIv, baseOffsets).getResult();
 
-        // Predicate Mask (handles tails where N % totalStep != 0)
         Value diff = rewriter.create<arith::SubIOp>(loc, ub, currentScalarIv);
-        Value zeroIdx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
         Value clampedDiff = rewriter.create<arith::MaxSIOp>(loc, zeroIdx, diff);
         Value mask = rewriter.create<vector::CreateMaskOp>(loc, maskType, clampedDiff);
 
         for (Operation &innerOp : op.getBody()->getOperations()) {
           if (innerOp.hasTrait<OpTrait::IsTerminator>()) {
-            // Handle scf.reduce by accumulating into our vector partialSums
             if (auto reduceOp = dyn_cast<scf::ReduceOp>(innerOp)) {
               for (auto [i, operand] : llvm::enumerate(reduceOp.getOperands())) {
                 Value val = mapping.lookupOrDefault(operand);
-                if (!llvm::isa<VectorType>(val.getType()))
+                if (!llvm::isa<VectorType>(val.getType())) // FIXED: llvm::isa
                   val = rewriter.create<vector::BroadcastOp>(loc, vType, val);
-                
-                if (llvm::isa<FloatType>(elementType))
-                  partialSums[i] = rewriter.create<arith::AddFOp>(loc, partialSums[i], val);
-                else
-                  partialSums[i] = rewriter.create<arith::AddIOp>(loc, partialSums[i], val);
+		partialSums[i] = llvm::isa<FloatType>(elementType) ? 
+		  rewriter.create<arith::AddFOp>(loc, partialSums[i], val).getResult() : 
+		  rewriter.create<arith::AddIOp>(loc, partialSums[i], val).getResult();
               }
             }
             continue;
@@ -270,74 +272,82 @@ namespace {
 
           if (auto load = dyn_cast<memref::LoadOp>(innerOp)) {
             SmallVector<Value> indices;
-            for (Value idx : load.getIndices()) 
-              indices.push_back(mapping.lookupOrDefault(idx));
-
-            auto vRead = rewriter.create<vector::TransferReadOp>(
-                loc, vType, mapping.lookupOrDefault(load.getMemref()), indices,
-                AffineMapAttr::get(rewriter.getMultiDimIdentityMap(1)),
-                zeroPadding, mask, rewriter.getBoolArrayAttr({false}));
-            mapping.map(load.getResult(), vRead.getResult());
+            for (Value idx : load.getIndices()) indices.push_back(mapping.lookupOrDefault(idx));
+            mapping.map(load.getResult(), rewriter.create<vector::TransferReadOp>(loc, vType, mapping.lookupOrDefault(load.getMemref()), indices, AffineMapAttr::get(rewriter.getMultiDimIdentityMap(1)), zeroPadding, mask, rewriter.getBoolArrayAttr({false})).getResult());
           } 
           else if (auto store = dyn_cast<memref::StoreOp>(innerOp)) {
             Value vecVal = mapping.lookupOrDefault(store.getValueToStore());
-            if (!llvm::isa<VectorType>(vecVal.getType()))
-              vecVal = rewriter.create<vector::BroadcastOp>(loc, vType, vecVal);
-
+            if (!llvm::isa<VectorType>(vecVal.getType())) vecVal = rewriter.create<vector::BroadcastOp>(loc, vType, vecVal);
             SmallVector<Value> indices;
-            for (Value idx : store.getIndices()) 
-              indices.push_back(mapping.lookupOrDefault(idx));
-
-            rewriter.create<vector::TransferWriteOp>(
-                loc, vecVal, mapping.lookupOrDefault(store.getMemref()), indices,
-                AffineMapAttr::get(rewriter.getMultiDimIdentityMap(1)),
-                mask, rewriter.getBoolArrayAttr({false}));
+            for (Value idx : store.getIndices()) indices.push_back(mapping.lookupOrDefault(idx));
+            rewriter.create<vector::TransferWriteOp>(loc, vecVal, mapping.lookupOrDefault(store.getMemref()), indices, AffineMapAttr::get(rewriter.getMultiDimIdentityMap(1)), mask, rewriter.getBoolArrayAttr({false}));
           }
-          else if (innerOp.getDialect()->getNamespace() == "arith" || 
-                   innerOp.getDialect()->getNamespace() == "math") {
+	  else if (auto memAtomic = llvm::dyn_cast<memref::AtomicRMWOp>(innerOp)) {
+	    Value valToProcess = mapping.lookupOrDefault(memAtomic.getValue());
+	    Value scalarVal;
+    
+	    if (llvm::isa<VectorType>(valToProcess.getType())) {
+	      auto vKind = getReductionKind(memAtomic.getKind());
+	      if (vKind) {
+		scalarVal = rewriter.create<vector::ReductionOp>(loc, *vKind, valToProcess);
+	      } else {
+
+		scalarVal = rewriter.create<vector::ExtractOp>(loc, valToProcess, ArrayRef<int64_t>{0});
+	      }
+	    } else {
+	      scalarVal = valToProcess;
+	    }
+    
+	    SmallVector<Value> indices;
+	    for (Value idx : memAtomic.getIndices())
+	      indices.push_back(mapping.lookupOrDefault(idx));
+	    rewriter.create<memref::AtomicRMWOp>(loc, memAtomic.getKind(), scalarVal, mapping.lookupOrDefault(memAtomic.getMemref()), indices);
+	  }
+          else if (innerOp.getDialect()->getNamespace() == "arith" || innerOp.getDialect()->getNamespace() == "math") {
+
+            
             SmallVector<Value> vOperands;
             for (Value operand : innerOp.getOperands()) {
-              if (operand == op.getInductionVars()[0]) {
-                vOperands.push_back(currentVectorIv);
-              } else {
-                Value v = mapping.lookupOrDefault(operand);
-                if (!llvm::isa<VectorType>(v.getType()))
-                  v = rewriter.create<vector::BroadcastOp>(loc, vType, v);
-                vOperands.push_back(v);
-              }
+	      Value v = (operand == op.getInductionVars()[0]) ? currentVectorIv : mapping.lookupOrDefault(operand);
+	      if (!llvm::isa<VectorType>(v.getType())) v = rewriter.create<vector::BroadcastOp>(loc, vType, v);
+	      vOperands.push_back(v);
             }
-
             OperationState state(loc, innerOp.getName().getStringRef());
             state.addOperands(vOperands);
-            for (Type t : innerOp.getResultTypes()) 
-              state.addTypes(VectorType::get({vWidth}, t));
+            for (Type t : innerOp.getResultTypes()) state.addTypes(VectorType::get({vWidth}, t));
             state.addAttributes(innerOp.getAttrs());
-            
             Operation *vOp = rewriter.create(state);
-            for (unsigned i = 0; i < innerOp.getNumResults(); ++i)
-              mapping.map(innerOp.getResult(i), vOp->getResult(i));
+            for (unsigned i = 0; i < innerOp.getNumResults(); ++i) mapping.map(innerOp.getResult(i), vOp->getResult(i));
           }
         }
       }
 
-      // Yield the accumulated vector partial sums
-      rewriter.setInsertionPointToEnd(newLoop.getBody());
+      rewriter.setInsertionPoint(emptyTerminator);
+      
       rewriter.create<scf::ReduceOp>(loc, partialSums);
+      
+      rewriter.eraseOp(emptyTerminator);
 
-      // Outside the loop: Perform horizontal reduction (Vector -> Scalar)
+      // Post-loop Horizontal Reductions (only if there are results)
       rewriter.setInsertionPointAfter(newLoop);
-      SmallVector<Value> scalarResults;
-      for (Value vRes : newLoop.getResults()) {
-          auto kind = llvm::isa<FloatType>(elementType) ? vector::CombiningKind::ADD : vector::CombiningKind::ADD;
-          Value scalar = rewriter.create<vector::ReductionOp>(loc, kind, vRes);
-          scalarResults.push_back(scalar);
-      }
-
-      rewriter.replaceOp(op, scalarResults);
+      if (newLoop.getNumResults() > 0) {
+          SmallVector<Value> scalarResults;
+          for (Value vRes : newLoop.getResults()) {
+              // Standard horizontal add reduction
+              scalarResults.push_back(
+                  rewriter.create<vector::ReductionOp>(loc, vector::CombiningKind::ADD, vRes).getResult()
+              );
+          }
+          rewriter.replaceOp(op, scalarResults);
+      } else {
+          // If the loop returns nothing, just erase the old loop
+          rewriter.eraseOp(op);
+      }     
+      
       return success();
-    } 
+    }
   };
-
+      
   // =========================================================================
   // Pass Runner
   // =========================================================================
@@ -386,17 +396,17 @@ namespace {
       RewritePatternSet collapsePatterns(ctx);
       collapsePatterns.add<ParallelLoopCollapsePattern>(ctx);
       (void)applyPatternsGreedily(module, std::move(collapsePatterns));
-
+      /*
       // Tile for Threads (Hierarchical Level 1)
       RewritePatternSet tilePatterns(ctx);
       tilePatterns.add<ParallelLoopTilingPattern>(ctx);
       (void)applyPatternsGreedily(module, std::move(tilePatterns));
-
+      */
       // Resolve Barriers by Fissioning the loops
       RewritePatternSet prePatterns(ctx);
       prePatterns.add<BarrierFissionPattern>(ctx);
       (void)applyPatternsGreedily(module, std::move(prePatterns));
-
+      
       // Strip-Mine and Vectorise the Innermost loops
       RewritePatternSet patterns(ctx);
       patterns.add<CUDAToVectorPattern>(ctx, finalWidth, finalUnrollFactor);
