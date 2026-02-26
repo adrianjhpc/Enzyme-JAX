@@ -103,9 +103,7 @@ namespace {
       Value ub = op.getUpperBound()[0];
       Value lb = op.getLowerBound()[0];
       Value totalIters = rewriter.create<arith::SubIOp>(loc, ub, lb);
-      Value numThreads = rewriter.create<arith::ConstantIndexOp>(loc, maxTheads);
-      Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-      Value temp = rewriter.create<arith::AddIOp>(loc, totalIters, rewriter.create<arith::SubIOp>(loc, numThreads, one));
+      Value numThreads = rewriter.create<arith::ConstantIndexOp>(loc, targetMaxThreads);
 
       Value threadChunk = rewriter.create<arith::DivUIOp>(loc, totalIters, numThreads);
       int64_t vectorFloorBytes = targetBitWidth * targetUnrollFactor;
