@@ -225,12 +225,29 @@ namespace {
 	  }
 	}
       }
-      
+     
       SmallVector<Value> vectorInits;
-      for (Type t : op.getResultTypes()) {
-        Value zero = rewriter.create<arith::ConstantOp>(loc, rewriter.getZeroAttr(t));
-        vectorInits.push_back(rewriter.create<vector::BroadcastOp>(loc, VectorType::get({vWidth}, t), zero));
-      }
+      for (auto [i, t] : llvm::enumerate(op.getResultTypes())) {
+        TypedAttr identityAttr; // Change to TypedAttr
+       
+        if (redKind == vector::CombiningKind::MUL) {
+          if (llvm::isa<FloatType>(t))
+            identityAttr = cast<TypedAttr>(rewriter.getFloatAttr(t, 1.0));
+          else
+            identityAttr = cast<TypedAttr>(rewriter.getIntegerAttr(t, 1));
+        } else if (redKind == vector::CombiningKind::MAXSI) {
+          if (llvm::isa<FloatType>(t))
+            identityAttr = cast<TypedAttr>(rewriter.getFloatAttr(t, -std::numeric_limits<double>::infinity()));
+          else
+            identityAttr = cast<TypedAttr>(rewriter.getIntegerAttr(t, std::numeric_limits<int64_t>::min()));
+        } else {
+          // getZeroAttr already returns a TypedAttr
+          identityAttr = cast<TypedAttr>(rewriter.getZeroAttr(t));
+        }
+
+        Value identity = rewriter.create<arith::ConstantOp>(loc, identityAttr);
+        vectorInits.push_back(rewriter.create<vector::BroadcastOp>(loc, VectorType::get({vWidth}, t), identity));
+      } 
 
       auto newLoop = rewriter.create<scf::ParallelOp>(loc, op.getLowerBound(), op.getUpperBound(), ValueRange{stepConst}, vectorInits);
       newLoop->setAttr("vectorized", rewriter.getUnitAttr());
@@ -327,6 +344,7 @@ namespace {
       } else {
         rewriter.eraseOp(op);
       }
+
       return success();
     }
   };
@@ -364,36 +382,26 @@ namespace {
         alloc.erase();
       }
 
-
-      RewritePatternSet structuralPatterns(ctx);
-      structuralPatterns.add<ParallelLoopCollapsePattern>(ctx);
-      structuralPatterns.add<ParallelLoopTilingPattern>(ctx, finalWidth, finalUnrollFactor, maxThreads);
-      structuralPatterns.add<BarrierFissionPattern>(ctx);
-      (void)applyPatternsGreedily(module, std::move(structuralPatterns));
-    
-      // Vectorization Phase (Manual Walk to prevent hanging)
-      // We create the pattern set but apply it explicitly.
       RewritePatternSet vectorPatterns(ctx);
-      vectorPatterns.add<CUDAToVectorPattern>(ctx, finalWidth, finalUnrollFactor);
-    
-      // We freeze the patterns for better performance and API compatibility
-      FrozenRewritePatternSet frozenVectorPatterns(std::move(vectorPatterns));
+    vectorPatterns.add<CUDAToVectorPattern>(ctx, finalWidth, finalUnrollFactor);
+    FrozenRewritePatternSet frozenVectorPatterns(std::move(vectorPatterns));
 
-      module.walk([&](scf::ParallelOp op) {
-	// Only target loops that are not already marked
-	if (!op->hasAttr("tiled") && !op->hasAttr("vectorized")) {
-	  bool hasNestedParallel = false;
-	  op.getRegion().walk([&](scf::ParallelOp nested) {
-	    if (nested != op) hasNestedParallel = true;
-	  });
-	  
-	  // If it's a leaf loop, apply patterns only to this operation
-	  if (!hasNestedParallel) {
-          // applyPatternsGreedily can take a list of ops to restrict its scope
-	    (void)applyPatternsGreedily(op, frozenVectorPatterns);
-	  }
-	}
-      });      
+    // Gather loops first to avoid "iterator invalidation" or seeing new loops
+    SmallVector<scf::ParallelOp> leafLoops;
+    module.walk([&](scf::ParallelOp op) {
+        if (!op->hasAttr("vectorized") && !op->hasAttr("tiled")) {
+            bool hasNested = false;
+            op.getRegion().walk([&](scf::ParallelOp nested) {
+                if (nested != op) hasNested = true;
+            });
+            if (!hasNested) leafLoops.push_back(op);
+        }
+    });
+
+    for (auto op : leafLoops) {
+        // Wrap the single op in a brace-init list to satisfy the ArrayRef requirement
+        (void)applyOpPatternsAndFold({op.getOperation()}, frozenVectorPatterns);
+    }
     }
     
   };
