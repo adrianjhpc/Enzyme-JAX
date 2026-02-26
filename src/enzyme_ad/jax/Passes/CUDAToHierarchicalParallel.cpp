@@ -108,7 +108,7 @@ namespace {
       Value temp = rewriter.create<arith::AddIOp>(loc, totalIters, rewriter.create<arith::SubIOp>(loc, numThreads, one));
 
       Value threadChunk = rewriter.create<arith::DivUIOp>(loc, totalIters, numThreads);
-      int64_t vectorFloorBytes = bitWidth * unrollFactor;
+      int64_t vectorFloorBytes = targetBitWidth * targetUnrollFactor;
       Value vectorFloor = rewriter.create<arith::ConstantIndexOp>(loc, vectorFloorBytes);
       // Clamp the tile size so we don't get vector lengths too short in the vectorisation pass
       Value tileSize = rewriter.create<arith::MaxSIOp>(loc, threadChunk, vectorFloor);          
