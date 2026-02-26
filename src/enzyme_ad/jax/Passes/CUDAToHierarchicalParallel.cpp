@@ -215,11 +215,10 @@ namespace {
 
       vector::CombiningKind redKind = vector::CombiningKind::ADD;
       if (op.getNumReductions() > 0) {
-	// The reduction logic is inside the scf.reduce ops at the end of the body
 	auto reduceOps = op.getBody()->getOps<scf::ReduceOp>();
 	if (!reduceOps.empty()) {
 	  scf::ReduceOp firstReduce = *reduceOps.begin();
-	  Block &redBlock = firstReduce.getReductionRegion().front();
+	  Block &redBlock = firstReduce.getRegion().front();
 	  if (!redBlock.empty() && !redBlock.front().hasTrait<OpTrait::IsTerminator>()) {
             if (auto kind = getReductionKindFromOp(&redBlock.front()))
 	      redKind = *kind;
