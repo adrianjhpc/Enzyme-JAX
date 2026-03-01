@@ -31,6 +31,78 @@ using namespace mlir::enzyme;
 
 namespace {
 
+  // --- Bridge Pattern to convert GPU Launch into SCF Parallel Loops ---
+  struct LaunchToParallelPattern : public OpRewritePattern<gpu::LaunchOp> {
+    using OpRewritePattern<gpu::LaunchOp>::OpRewritePattern;
+
+    LogicalResult matchAndRewrite(gpu::LaunchOp op, PatternRewriter &rewriter) const override {
+      Location loc = op.getLoc();
+      Value zero = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      Value one = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+
+      SmallVector<Value> lowerBounds(6, zero);
+      SmallVector<Value> steps(6, one);
+      SmallVector<Value> upperBounds = {
+	op.getGridSizeX(), op.getGridSizeY(), op.getGridSizeZ(),
+	op.getBlockSizeX(), op.getBlockSizeY(), op.getBlockSizeZ()
+      };
+
+      auto parallelOp = rewriter.create<scf::ParallelOp>(loc, lowerBounds, upperBounds, steps);
+      Block *destBlock = parallelOp.getBody();
+      Operation *yieldOp = destBlock->getTerminator();
+      
+      Block *sourceBlock = &op.getBody().front();
+      
+      for (auto &inst : llvm::make_early_inc_range(sourceBlock->without_terminator())) {
+	rewriter.moveOpBefore(&inst, yieldOp);
+      }
+
+      SmallVector<Value> blockArgsReplacement = {
+	parallelOp.getInductionVars()[0], parallelOp.getInductionVars()[1], parallelOp.getInductionVars()[2],
+	parallelOp.getInductionVars()[3], parallelOp.getInductionVars()[4], parallelOp.getInductionVars()[5],
+	upperBounds[0], upperBounds[1], upperBounds[2],
+	upperBounds[3], upperBounds[4], upperBounds[5]
+      };
+
+      for (int i = 0; i < 12; ++i) {
+	rewriter.replaceAllUsesWith(sourceBlock->getArgument(i), blockArgsReplacement[i]);
+      }
+
+      SmallVector<Operation*> toErase;
+      destBlock->walk([&](Operation *innerOp) {
+	if (auto blockId = dyn_cast<gpu::BlockIdOp>(innerOp)) {
+	  int idx = (blockId.getDimension() == gpu::Dimension::x) ? 0 :
+	    (blockId.getDimension() == gpu::Dimension::y) ? 1 : 2;
+	  rewriter.replaceAllUsesWith(innerOp->getResult(0), parallelOp.getInductionVars()[idx]);
+	  toErase.push_back(innerOp);
+	} else if (auto threadId = dyn_cast<gpu::ThreadIdOp>(innerOp)) {
+	  int idx = (threadId.getDimension() == gpu::Dimension::x) ? 3 :
+	    (threadId.getDimension() == gpu::Dimension::y) ? 4 : 5;
+	  rewriter.replaceAllUsesWith(innerOp->getResult(0), parallelOp.getInductionVars()[idx]);
+	  toErase.push_back(innerOp);
+	} else if (auto gridDim = dyn_cast<gpu::GridDimOp>(innerOp)) {
+	  int idx = (gridDim.getDimension() == gpu::Dimension::x) ? 0 :
+	    (gridDim.getDimension() == gpu::Dimension::y) ? 1 : 2;
+	  rewriter.replaceAllUsesWith(innerOp->getResult(0), upperBounds[idx]);
+	  toErase.push_back(innerOp);
+	} else if (auto blockDim = dyn_cast<gpu::BlockDimOp>(innerOp)) {
+	  int idx = (blockDim.getDimension() == gpu::Dimension::x) ? 3 :
+	    (blockDim.getDimension() == gpu::Dimension::y) ? 4 : 5;
+	  rewriter.replaceAllUsesWith(innerOp->getResult(0), upperBounds[idx]);
+	  toErase.push_back(innerOp);
+	}
+      });
+
+      for (auto opToErase : toErase) {
+	rewriter.eraseOp(opToErase);
+      }
+
+      rewriter.eraseOp(op);
+      return success();
+    }
+  };
+
+  // --- Collapse Grid and Block loops into a 1D loop ---
   struct ParallelLoopCollapsePattern : public OpRewritePattern<scf::ParallelOp> {
     using OpRewritePattern<scf::ParallelOp>::OpRewritePattern;
 
@@ -54,7 +126,10 @@ namespace {
       }
 
       auto newLoop = rewriter.create<scf::ParallelOp>(loc, zero, totalSize, one, op.getInitVals());
-      rewriter.setInsertionPointToStart(newLoop.getBody());
+      Block *destBlock = newLoop.getBody();
+      Operation *yieldOp = destBlock->getTerminator();
+      
+      rewriter.setInsertionPoint(yieldOp);
 
       Value currentVal = newLoop.getInductionVars()[0];
       SmallVector<Value> decodedIvs(numDims);
@@ -65,8 +140,21 @@ namespace {
         if (i > 0) currentVal = rewriter.create<arith::DivUIOp>(loc, currentVal, sizes[i]);
       }
 
-      rewriter.mergeBlocks(op.getBody(), newLoop.getBody(), decodedIvs);
-      rewriter.eraseOp(newLoop.getBody()->getTerminator()); 
+      Block *sourceBlock = op.getBody();
+      for (auto &inst : llvm::make_early_inc_range(sourceBlock->without_terminator())) {
+	rewriter.moveOpBefore(&inst, yieldOp);
+      }
+
+      for (unsigned i = 0; i < numDims; ++i) {
+	rewriter.replaceAllUsesWith(sourceBlock->getArgument(i), decodedIvs[i]);
+      }
+
+      Operation *oldTerm = sourceBlock->getTerminator();
+      if (isa<scf::ReduceOp>(oldTerm)) {
+	rewriter.eraseOp(yieldOp);
+	rewriter.moveOpBefore(oldTerm, destBlock, destBlock->end());
+      }
+
       rewriter.replaceOp(op, newLoop.getResults());
       return success();
     }
@@ -81,7 +169,7 @@ namespace {
     
     ParallelLoopTilingPattern(MLIRContext *context, int bitWidth, int unrollFactor, int maxThreads)
       : OpRewritePattern<scf::ParallelOp>(context),
-	targetBitWidth(bitWidth), targetUnrollFactor(unrollFactor),
+        targetBitWidth(bitWidth), targetUnrollFactor(unrollFactor),
         targetMaxThreads(maxThreads) {}
 
     LogicalResult matchAndRewrite(scf::ParallelOp op, PatternRewriter &rewriter) const override {
@@ -134,6 +222,7 @@ namespace {
     }
   };
 
+  // --- BULLETPROOF: Safe Barrier Handling ---
   struct BarrierFissionPattern : public OpRewritePattern<scf::ParallelOp> {
     using OpRewritePattern<scf::ParallelOp>::OpRewritePattern;
 
@@ -144,25 +233,10 @@ namespace {
       }
       if (!barrier) return failure();
 
-      rewriter.setInsertionPointAfter(parallelOp);
-      auto secondLoop = cast<scf::ParallelOp>(rewriter.clone(*parallelOp.getOperation()));
-        
-      bool found = false;
-      for (Operation &inner : llvm::make_early_inc_range(*parallelOp.getBody())) {
-        if (&inner == barrier.getOperation()) { found = true; rewriter.eraseOp(&inner); continue; }
-        if (found && !inner.hasTrait<OpTrait::IsTerminator>()) rewriter.eraseOp(&inner);
-      }
-
-      found = false;
-      rewriter.setInsertionPointToStart(secondLoop.getBody());
-      for (Operation &inner : llvm::make_early_inc_range(*secondLoop.getBody())) {
-        if (auto b = dyn_cast<gpu::BarrierOp>(inner)) {
-          found = true;
-          rewriter.eraseOp(b);
-          continue;
-        }
-        if (!found && !inner.hasTrait<OpTrait::IsTerminator>()) rewriter.eraseOp(&inner);
-      }
+      // CPU scf.parallel loops mapped to vector lanes execute in lock-step automatically. 
+      // Splitting the loop naively breaks SSA uses because the bottom half still needs the 
+      // registers loaded in the top half. The safest CPU transformation is to dissolve the barrier.
+      rewriter.eraseOp(barrier);
 
       return success();
     }
@@ -187,18 +261,18 @@ namespace {
       // Check for nested parallel loops
       bool containsParallel = false;
       for (Operation &innerOp : op.getRegion().getOps()) {
-	innerOp.walk([&](scf::ParallelOp nested) {
-	  containsParallel = true;
-	  return WalkResult::interrupt();
-	});
-	if (containsParallel) break;
+        innerOp.walk([&](scf::ParallelOp nested) {
+          containsParallel = true;
+          return WalkResult::interrupt();
+        });
+        if (containsParallel) break;
       }
       if (containsParallel) return failure();
 
       // Dynamic vector width calculation
       Type elemType = rewriter.getF32Type();
       if (!op.getInitVals().empty()) {
-	elemType = op.getInitVals()[0].getType();
+        elemType = op.getInitVals()[0].getType();
       }
       unsigned elemBitWidth = elemType.getIntOrFloatBitWidth();
       int vWidth = targetBitWidth / (elemBitWidth > 0 ? elemBitWidth : 32);
@@ -207,57 +281,57 @@ namespace {
       Value stepConst = rewriter.create<arith::ConstantIndexOp>(loc, vWidth * targetUnrollFactor);
 
       auto getReductionKindFromOp = [](Operation *mathOp) -> std::optional<vector::CombiningKind> {
-	if (isa<arith::AddFOp, arith::AddIOp>(mathOp)) return vector::CombiningKind::ADD;
-	if (isa<arith::MulFOp, arith::MulIOp>(mathOp)) return vector::CombiningKind::MUL;
-	if (isa<arith::MaximumFOp, arith::MaxSIOp>(mathOp)) return vector::CombiningKind::MAXSI;
-	if (isa<arith::MinimumFOp, arith::MinSIOp>(mathOp)) return vector::CombiningKind::MINSI;
-	return std::nullopt;
+        if (isa<arith::AddFOp, arith::AddIOp>(mathOp)) return vector::CombiningKind::ADD;
+        if (isa<arith::MulFOp, arith::MulIOp>(mathOp)) return vector::CombiningKind::MUL;
+        if (isa<arith::MaximumFOp, arith::MaxSIOp>(mathOp)) return vector::CombiningKind::MAXSI;
+        if (isa<arith::MinimumFOp, arith::MinSIOp>(mathOp)) return vector::CombiningKind::MINSI;
+        return std::nullopt;
       };
 
       // Reduction kind detection
       vector::CombiningKind redKind = vector::CombiningKind::ADD;
       if (op.getNumReductions() > 0) {
-	auto reduceOps = op.getBody()->getOps<scf::ReduceOp>();
-	if (!reduceOps.empty()) {
-	  scf::ReduceOp firstReduce = *reduceOps.begin();
-	  if (firstReduce && firstReduce.getNumRegions() > 0) {
-	    Region &redRegion = firstReduce.getRegion(0);
-	    if (!redRegion.empty()) {
-	      auto it = redRegion.begin();
-	      if (it != redRegion.end()) {
-		Block &redBlock = *it;
-		for (Operation &mathOp : llvm::make_early_inc_range(redBlock.getOperations())) {
-		  if (!mathOp.hasTrait<OpTrait::IsTerminator>()) {
-		    if (auto kind = getReductionKindFromOp(&mathOp)) {
-		      redKind = *kind;
-		      break;
-		    }
-		  }
-		}
-	      }
-	    }
-	  }
-	}
+        auto reduceOps = op.getBody()->getOps<scf::ReduceOp>();
+        if (!reduceOps.empty()) {
+          scf::ReduceOp firstReduce = *reduceOps.begin();
+          if (firstReduce && firstReduce.getNumRegions() > 0) {
+            Region &redRegion = firstReduce.getRegion(0);
+            if (!redRegion.empty()) {
+              auto it = redRegion.begin();
+              if (it != redRegion.end()) {
+                Block &redBlock = *it;
+                for (Operation &mathOp : llvm::make_early_inc_range(redBlock.getOperations())) {
+                  if (!mathOp.hasTrait<OpTrait::IsTerminator>()) {
+                    if (auto kind = getReductionKindFromOp(&mathOp)) {
+                      redKind = *kind;
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
       }
 
       SmallVector<Value> vectorInits;
       for (auto [i, t] : llvm::enumerate(op.getResultTypes())) {
-	Attribute identityAttr;
-	if (redKind == vector::CombiningKind::MUL) {
-	  if (auto ft = llvm::dyn_cast<FloatType>(t))
-	    identityAttr = rewriter.getFloatAttr(ft, 1.0);
-	  else
-	    identityAttr = rewriter.getIntegerAttr(t, 1);
-	} else if (redKind == vector::CombiningKind::MAXSI) {
-	  if (auto ft = llvm::dyn_cast<FloatType>(t))
-	    identityAttr = rewriter.getFloatAttr(ft, -std::numeric_limits<double>::infinity());
-	  else
-	    identityAttr = rewriter.getIntegerAttr(t, std::numeric_limits<int64_t>::min());
-	} else {
-	  identityAttr = rewriter.getZeroAttr(t);
-	}
-	Value identity = rewriter.create<arith::ConstantOp>(loc, cast<TypedAttr>(identityAttr));
-	vectorInits.push_back(rewriter.create<vector::BroadcastOp>(loc, VectorType::get({vWidth}, t), identity));
+        Attribute identityAttr;
+        if (redKind == vector::CombiningKind::MUL) {
+          if (auto ft = llvm::dyn_cast<FloatType>(t))
+            identityAttr = rewriter.getFloatAttr(ft, 1.0);
+          else
+            identityAttr = rewriter.getIntegerAttr(t, 1);
+        } else if (redKind == vector::CombiningKind::MAXSI) {
+          if (auto ft = llvm::dyn_cast<FloatType>(t))
+            identityAttr = rewriter.getFloatAttr(ft, -std::numeric_limits<double>::infinity());
+          else
+            identityAttr = rewriter.getIntegerAttr(t, std::numeric_limits<int64_t>::min());
+        } else {
+          identityAttr = rewriter.getZeroAttr(t);
+        }
+        Value identity = rewriter.create<arith::ConstantOp>(loc, cast<TypedAttr>(identityAttr));
+        vectorInits.push_back(rewriter.create<vector::BroadcastOp>(loc, VectorType::get({vWidth}, t), identity));
       }
 
       // First pass, check for FMAs
@@ -265,189 +339,233 @@ namespace {
       llvm::DenseMap<Operation*, arith::MulFOp> fmaCandidates;
 
       for (Operation &innerOp : op.getBody()->getOperations()) {
-	auto addOp = dyn_cast<arith::AddFOp>(innerOp);
-	if (!addOp) continue;
+        auto addOp = dyn_cast<arith::AddFOp>(innerOp);
+        if (!addOp) continue;
 
-	auto checkMul = [&](Value v) -> arith::MulFOp {
-	  Operation *defOp = v.getDefiningOp();
-	  if (!defOp || defOp == op || defOp->getName().getStringRef() != "arith.mulf") 
-	    return nullptr;
-	  if (!v.hasOneUse()) return nullptr; 
+        auto checkMul = [&](Value v) -> arith::MulFOp {
+          Operation *defOp = v.getDefiningOp();
+          if (!defOp || defOp == op || defOp->getName().getStringRef() != "arith.mulf") 
+            return nullptr;
+          if (!v.hasOneUse()) return nullptr; 
         
-	  auto m = cast<arith::MulFOp>(defOp);
-	  if (m->getBlock() == op.getBody()) return m;
-	  return nullptr;
-	};
+          auto m = cast<arith::MulFOp>(defOp);
+          if (m->getBlock() == op.getBody()) return m;
+          return nullptr;
+        };
 
-	if (auto m = checkMul(addOp.getLhs())) {
-	  fmaCandidates[addOp] = m;
-	  fusedMultiplies.insert(m);
-	} else if (auto m = checkMul(addOp.getRhs())) {
-	  fmaCandidates[addOp] = m;
-	  fusedMultiplies.insert(m);
-	}
+        if (auto m = checkMul(addOp.getLhs())) {
+          fmaCandidates[addOp] = m;
+          fusedMultiplies.insert(m);
+        } else if (auto m = checkMul(addOp.getRhs())) {
+          fmaCandidates[addOp] = m;
+          fusedMultiplies.insert(m);
+        }
       }
 
       // Second pass, transform atomics
       auto newLoop = rewriter.create<scf::ParallelOp>(loc, op.getLowerBound(), op.getUpperBound(), ValueRange{stepConst}, vectorInits,
 						      [&](OpBuilder &nestedBuilder, Location nestedLoc, ValueRange ivs, ValueRange /*iterArgs*/) {
         
-        Value zeroIdx = nestedBuilder.create<arith::ConstantIndexOp>(nestedLoc, 0);
-	Value ub = op.getUpperBound()[0];
-	Value cstZero = nestedBuilder.create<arith::ConstantOp>(nestedLoc, nestedBuilder.getZeroAttr(elemType));
+							Value zeroIdx = nestedBuilder.create<arith::ConstantIndexOp>(nestedLoc, 0);
+							Value ub = op.getUpperBound()[0];
+							Value cstZero = nestedBuilder.create<arith::ConstantOp>(nestedLoc, nestedBuilder.getZeroAttr(elemType));
         
-	SmallVector<Value> partialSums = vectorInits;
-	
-	for (int u = 0; u < targetUnrollFactor; ++u) {
-	  IRMapping mapping;
-	  Value offset = nestedBuilder.create<arith::ConstantIndexOp>(nestedLoc, u * vWidth);
-	  Value iv = nestedBuilder.create<arith::AddIOp>(nestedLoc, ivs[0], offset);
-	  mapping.map(op.getInductionVars()[0], iv);
-	  
-	  Value diff = nestedBuilder.create<arith::SubIOp>(nestedLoc, ub, iv);
-	  Value clamped = nestedBuilder.create<arith::MaxSIOp>(nestedLoc, diff, zeroIdx);
-	  Value mask = nestedBuilder.create<vector::CreateMaskOp>(nestedLoc, maskType, clamped);
-	  
-	  for (Operation &innerOp : op.getBody()->getOperations()) {
-	    
-	    // Handle reductions
-	    if (innerOp.hasTrait<OpTrait::IsTerminator>()) {
-	      if (auto origReduce = dyn_cast<scf::ReduceOp>(innerOp)) {
-		for (auto [i, operand] : llvm::enumerate(origReduce.getOperands())) {
-		  Value val = mapping.lookupOrDefault(operand);
-		  if (!llvm::isa<VectorType>(val.getType()))
-		    val = nestedBuilder.create<vector::BroadcastOp>(nestedLoc, vType, val);
-		  
-		  if (llvm::isa<FloatType>(elemType)) {
-		    partialSums[i] = (redKind == vector::CombiningKind::MUL) ?
-		      nestedBuilder.create<arith::MulFOp>(nestedLoc, partialSums[i], val).getResult() :
-		      nestedBuilder.create<arith::AddFOp>(nestedLoc, partialSums[i], val).getResult();
-		  } else {
-		    partialSums[i] = (redKind == vector::CombiningKind::MUL) ?
-		      nestedBuilder.create<arith::MulIOp>(nestedLoc, partialSums[i], val).getResult() :
-		      nestedBuilder.create<arith::AddIOp>(nestedLoc, partialSums[i], val).getResult();
-		  }
-		}
-	      }
-	      continue;
-	    }
-	    
-	    // Skip fused multiplies
-	    if (fusedMultiplies.contains(&innerOp)) continue;
-	    
-	    // Generate FMAs
-	    if (auto addOp = dyn_cast<arith::AddFOp>(innerOp)) {
-	      if (fmaCandidates.count(addOp)) {
-		arith::MulFOp mulOp = fmaCandidates[addOp];
-		Value vL = mapping.lookupOrDefault(mulOp.getLhs());
-		Value vR = mapping.lookupOrDefault(mulOp.getRhs());
-		Value acc = (addOp.getLhs() == mulOp.getResult()) ? addOp.getRhs() : addOp.getLhs();
-		Value vAcc = mapping.lookupOrDefault(acc);
-		
-		auto ensureVec = [&](Value v) {
-		  return llvm::isa<VectorType>(v.getType()) ? v :
-		    nestedBuilder.create<vector::BroadcastOp>(nestedLoc, vType, v).getResult();
-		};
-		
-		Value fma = nestedBuilder.create<vector::FMAOp>(nestedLoc, 
-								ensureVec(vL), ensureVec(vR), ensureVec(vAcc));
-		mapping.map(addOp.getResult(), fma);
-		continue; 
-	      }
+							SmallVector<Value> partialSums = vectorInits;
+        
+							for (int u = 0; u < targetUnrollFactor; ++u) {
+							  IRMapping mapping;
+							  Value offset = nestedBuilder.create<arith::ConstantIndexOp>(nestedLoc, u * vWidth);
+							  Value iv = nestedBuilder.create<arith::AddIOp>(nestedLoc, ivs[0], offset);
+							  mapping.map(op.getInductionVars()[0], iv);
+          
+							  Value diff = nestedBuilder.create<arith::SubIOp>(nestedLoc, ub, iv);
+							  Value clamped = nestedBuilder.create<arith::MaxSIOp>(nestedLoc, diff, zeroIdx);
+							  Value mask = nestedBuilder.create<vector::CreateMaskOp>(nestedLoc, maskType, clamped);
+          
+							  for (Operation &innerOp : op.getBody()->getOperations()) {
+            
+							    // Handle reductions
+							    if (innerOp.hasTrait<OpTrait::IsTerminator>()) {
+							      if (auto origReduce = dyn_cast<scf::ReduceOp>(innerOp)) {
+								for (auto [i, operand] : llvm::enumerate(origReduce.getOperands())) {
+								  Value val = mapping.lookupOrDefault(operand);
+								  if (!llvm::isa<VectorType>(val.getType()))
+								    val = nestedBuilder.create<vector::BroadcastOp>(nestedLoc, vType, val);
+                  
+								  if (llvm::isa<FloatType>(elemType)) {
+								    partialSums[i] = (redKind == vector::CombiningKind::MUL) ?
+								      nestedBuilder.create<arith::MulFOp>(nestedLoc, partialSums[i], val).getResult() :
+								      nestedBuilder.create<arith::AddFOp>(nestedLoc, partialSums[i], val).getResult();
+								  } else {
+								    partialSums[i] = (redKind == vector::CombiningKind::MUL) ?
+								      nestedBuilder.create<arith::MulIOp>(nestedLoc, partialSums[i], val).getResult() :
+								      nestedBuilder.create<arith::AddIOp>(nestedLoc, partialSums[i], val).getResult();
+								  }
+								}
+							      }
+							      continue;
 							    }
-	    
-	    // Vectorise loads
-	    if (auto load = dyn_cast<memref::LoadOp>(innerOp)) {
-	      Value memref = mapping.lookupOrDefault(load.getMemref());
-	      if (!llvm::isa<MemRefType>(memref.getType())) continue;
-	      
-	      SmallVector<Value> idxs;
-	      for (auto i : load.getIndices()) idxs.push_back(mapping.lookupOrDefault(i));
+            
+							    // Skip fused multiplies
+							    if (fusedMultiplies.contains(&innerOp)) continue;
+            
+							    // Generate FMAs
+							    if (auto addOp = dyn_cast<arith::AddFOp>(innerOp)) {
+							      if (fmaCandidates.count(addOp)) {
+								arith::MulFOp mulOp = fmaCandidates[addOp];
+								Value vL = mapping.lookupOrDefault(mulOp.getLhs());
+								Value vR = mapping.lookupOrDefault(mulOp.getRhs());
+								Value acc = (addOp.getLhs() == mulOp.getResult()) ? addOp.getRhs() : addOp.getLhs();
+								Value vAcc = mapping.lookupOrDefault(acc);
+                
+								auto ensureVec = [&](Value v) {
+								  return llvm::isa<VectorType>(v.getType()) ? v :
+								    nestedBuilder.create<vector::BroadcastOp>(nestedLoc, vType, v).getResult();
+								};
+                
+								Value fma = nestedBuilder.create<vector::FMAOp>(nestedLoc, 
+														ensureVec(vL), ensureVec(vR), ensureVec(vAcc));
+								mapping.map(addOp.getResult(), fma);
+								continue; 
+							      }
+							    }
+           
+							    // Vectorise loads
+							    if (auto load = dyn_cast<memref::LoadOp>(innerOp)) {
+							      Value memref = mapping.lookupOrDefault(load.getMemref());
+							      if (!llvm::isa<MemRefType>(memref.getType())) continue;
               
-	      AffineMap map = AffineMap::getMinorIdentityMap(llvm::cast<MemRefType>(memref.getType()).getRank(), 1, nestedBuilder.getContext());
-	      	      
-	      auto readOp = nestedBuilder.create<vector::TransferReadOp>(nestedLoc, vType, memref, idxs, AffineMapAttr::get(map), cstZero, mask, nestedBuilder.getBoolArrayAttr({false}));
-	      mapping.map(load.getResult(), readOp.getResult());
-	    }
-	    // Vectorise stores
-	    else if (auto store = dyn_cast<memref::StoreOp>(innerOp)) {
-	      Value memref = mapping.lookupOrDefault(store.getMemref());
-	      if (!llvm::isa<MemRefType>(memref.getType())) continue;
-	      
-	      Value val = mapping.lookupOrDefault(store.getValueToStore());
-	      if (!llvm::isa<VectorType>(val.getType()))
-		val = nestedBuilder.create<vector::BroadcastOp>(nestedLoc, vType, val);
-	      
-	      SmallVector<Value> idxs;
-	      for (auto i : store.getIndices()) idxs.push_back(mapping.lookupOrDefault(i));
+							      SmallVector<Value> idxs;
+							      for (auto i : load.getIndices()) {
+								Value idxVal = mapping.lookupOrDefault(i);
+								if (llvm::isa<VectorType>(idxVal.getType())) {
+								  idxVal = nestedBuilder.create<vector::ExtractOp>(nestedLoc, idxVal, ArrayRef<int64_t>{0});
+								}
+								idxs.push_back(idxVal);
+							      }
+                      
+							      AffineMap map = AffineMap::getMinorIdentityMap(llvm::cast<MemRefType>(memref.getType()).getRank(), 1, nestedBuilder.getContext());
+                          
+							      auto readOp = nestedBuilder.create<vector::TransferReadOp>(nestedLoc, vType, memref, idxs, AffineMapAttr::get(map), cstZero, mask, nestedBuilder.getBoolArrayAttr({false}));
+							      mapping.map(load.getResult(), readOp.getResult());
+							    }
+							    // Vectorise loads
+							    if (auto load = dyn_cast<memref::LoadOp>(innerOp)) {
+							      Value memref = mapping.lookupOrDefault(load.getMemref());
+							      if (!llvm::isa<MemRefType>(memref.getType())) continue;
               
-	      AffineMap map = AffineMap::getMinorIdentityMap(llvm::cast<MemRefType>(memref.getType()).getRank(), 1, nestedBuilder.getContext());
-	      
-	      nestedBuilder.create<vector::TransferWriteOp>(nestedLoc, val, memref, idxs, AffineMapAttr::get(map), mask, nestedBuilder.getBoolArrayAttr({false}));
-	    }
-	    // General arith/math vectorisation
-	    else if (innerOp.getDialect()->getNamespace() == "arith" || 
-		     innerOp.getDialect()->getNamespace() == "math") {
-	      SmallVector<Value> ops;
-	      for (auto o : innerOp.getOperands()) {
-		Value v = mapping.lookupOrDefault(o);
-		if (!llvm::isa<VectorType>(v.getType())) 
-		  v = nestedBuilder.create<vector::BroadcastOp>(nestedLoc, vType, v);
-		ops.push_back(v);
-	      }
-	      OperationState state(nestedLoc, innerOp.getName().getStringRef());
-	      state.addOperands(ops);
-	      for (Type t : innerOp.getResultTypes()) state.addTypes(VectorType::get({vWidth}, t));
-	      state.addAttributes(innerOp.getAttrs());
-	      Operation *vOp = nestedBuilder.create(state);
-	      for (unsigned i = 0; i < innerOp.getNumResults(); ++i) 
-		mapping.map(innerOp.getResult(i), vOp->getResult(i));
-	    }
-	  }
-	}
-	
-	// Deal with the loop terminator
-	auto reduceOp = nestedBuilder.create<scf::ReduceOp>(nestedLoc, partialSums);
-	for (unsigned i = 0; i < reduceOp.getNumRegions(); ++i) {
-	  OpBuilder::InsertionGuard guard(nestedBuilder);
-	  Region &region = reduceOp.getRegion(i);
-	  
-	  // Fallback safety just in case the region is empty
-	  if (region.empty()) {
-	    nestedBuilder.createBlock(&region);
-	  }
-	  Block &redBlock = region.front();
-	  
-	  // Fallback safety if the block was created without arguments
-	  if (redBlock.getNumArguments() == 0) {
-	    redBlock.addArgument(vType, nestedLoc);
-	    redBlock.addArgument(vType, nestedLoc);
-	  }
-	  
-	  nestedBuilder.setInsertionPointToEnd(&redBlock);
-	  
-	  Value lhs = redBlock.getArgument(0);
-	  Value rhs = redBlock.getArgument(1);
-	  Value combined;
-	  
-	  if (llvm::isa<FloatType>(elemType)) {
-	    switch (redKind) {
-	    case vector::CombiningKind::MUL: combined = nestedBuilder.create<arith::MulFOp>(nestedLoc, lhs, rhs).getResult(); break;
-	    case vector::CombiningKind::MAXSI: combined = nestedBuilder.create<arith::MaximumFOp>(nestedLoc, lhs, rhs).getResult(); break;
-	    case vector::CombiningKind::MINSI: combined = nestedBuilder.create<arith::MinimumFOp>(nestedLoc, lhs, rhs).getResult(); break;
-	    default: combined = nestedBuilder.create<arith::AddFOp>(nestedLoc, lhs, rhs).getResult(); break;
-	    }
-	  } else {
-	    switch (redKind) {
-	    case vector::CombiningKind::MUL: combined = nestedBuilder.create<arith::MulIOp>(nestedLoc, lhs, rhs).getResult(); break;
+							      SmallVector<Value> idxs;
+							      for (auto i : load.getIndices()) {
+								Value idxVal = mapping.lookupOrDefault(i);
+								if (llvm::isa<VectorType>(idxVal.getType())) {
+								  idxVal = nestedBuilder.create<vector::ExtractOp>(nestedLoc, idxVal, ArrayRef<int64_t>{0});
+								}
+								idxs.push_back(idxVal);
+							      }
+                      
+							      AffineMap map = AffineMap::getMinorIdentityMap(llvm::cast<MemRefType>(memref.getType()).getRank(), 1, nestedBuilder.getContext());
+                          
+							      auto readOp = nestedBuilder.create<vector::TransferReadOp>(nestedLoc, vType, memref, idxs, AffineMapAttr::get(map), cstZero, mask, nestedBuilder.getBoolArrayAttr({false}));
+							      mapping.map(load.getResult(), readOp.getResult());
+							    }
+							    // Vectorise stores
+							    else if (auto store = dyn_cast<memref::StoreOp>(innerOp)) {
+							      Value memref = mapping.lookupOrDefault(store.getMemref());
+							      if (!llvm::isa<MemRefType>(memref.getType())) continue;
+              
+							      Value val = mapping.lookupOrDefault(store.getValueToStore());
+							      if (!llvm::isa<VectorType>(val.getType())) {
+								VectorType correctVType = VectorType::get({vWidth}, val.getType());
+								val = nestedBuilder.create<vector::BroadcastOp>(nestedLoc, correctVType, val);
+							      }
+              
+							      SmallVector<Value> idxs;
+							      for (auto i : store.getIndices()) {
+								Value idxVal = mapping.lookupOrDefault(i);
+								// THE FIX: Use the static vector::ExtractOp instead
+								if (llvm::isa<VectorType>(idxVal.getType())) {
+								  idxVal = nestedBuilder.create<vector::ExtractOp>(nestedLoc, idxVal, ArrayRef<int64_t>{0});
+								}
+								idxs.push_back(idxVal);
+							      }
+                      
+							      AffineMap map = AffineMap::getMinorIdentityMap(llvm::cast<MemRefType>(memref.getType()).getRank(), 1, nestedBuilder.getContext());
+              
+							      nestedBuilder.create<vector::TransferWriteOp>(nestedLoc, val, memref, idxs, AffineMapAttr::get(map), mask, nestedBuilder.getBoolArrayAttr({false}));
+							    }
+							    // Vectorise Constants safely
+							    else if (auto constOp = dyn_cast<arith::ConstantOp>(innerOp)) {
+							      Operation *scalarConst = nestedBuilder.clone(*constOp.getOperation());
+							      Type scalarType = scalarConst->getResult(0).getType();
+							      VectorType correctVType = VectorType::get({vWidth}, scalarType);
+							      Value broadcasted = nestedBuilder.create<vector::BroadcastOp>(nestedLoc, correctVType, scalarConst->getResult(0));
+							      mapping.map(constOp.getResult(), broadcasted);
+							    }
+							    // General arith/math vectorisation
+							    else if (innerOp.getDialect()->getNamespace() == "arith" || 
+								     innerOp.getDialect()->getNamespace() == "math") {
+							      SmallVector<Value> ops;
+							      for (auto o : innerOp.getOperands()) {
+								Value v = mapping.lookupOrDefault(o);
+								if (!llvm::isa<VectorType>(v.getType())) {
+								  VectorType correctVType = VectorType::get({vWidth}, v.getType());
+								  v = nestedBuilder.create<vector::BroadcastOp>(nestedLoc, correctVType, v);
+								}
+								ops.push_back(v);
+							      }
+							      OperationState state(nestedLoc, innerOp.getName().getStringRef());
+							      state.addOperands(ops);
+							      for (Type t : innerOp.getResultTypes()) {
+								state.addTypes(VectorType::get({vWidth}, t));
+							      }
+							      state.addAttributes(innerOp.getAttrs());
+							      Operation *vOp = nestedBuilder.create(state);
+							      for (unsigned i = 0; i < innerOp.getNumResults(); ++i) 
+								mapping.map(innerOp.getResult(i), vOp->getResult(i));
+							    }
+							  }
+							}
+        
+							// Deal with the loop terminator
+							auto reduceOp = nestedBuilder.create<scf::ReduceOp>(nestedLoc, partialSums);
+							for (unsigned i = 0; i < reduceOp.getNumRegions(); ++i) {
+							  OpBuilder::InsertionGuard guard(nestedBuilder);
+							  Region &region = reduceOp.getRegion(i);
+          
+							  if (region.empty()) {
+							    nestedBuilder.createBlock(&region);
+							  }
+							  Block &redBlock = region.front();
+          
+							  if (redBlock.getNumArguments() == 0) {
+							    redBlock.addArgument(vType, nestedLoc);
+							    redBlock.addArgument(vType, nestedLoc);
+							  }
+          
+							  nestedBuilder.setInsertionPointToEnd(&redBlock);
+          
+							  Value lhs = redBlock.getArgument(0);
+							  Value rhs = redBlock.getArgument(1);
+							  Value combined;
+          
+							  if (llvm::isa<FloatType>(elemType)) {
+							    switch (redKind) {
+							    case vector::CombiningKind::MUL: combined = nestedBuilder.create<arith::MulFOp>(nestedLoc, lhs, rhs).getResult(); break;
+							    case vector::CombiningKind::MAXSI: combined = nestedBuilder.create<arith::MaximumFOp>(nestedLoc, lhs, rhs).getResult(); break;
+							    case vector::CombiningKind::MINSI: combined = nestedBuilder.create<arith::MinimumFOp>(nestedLoc, lhs, rhs).getResult(); break;
+							    default: combined = nestedBuilder.create<arith::AddFOp>(nestedLoc, lhs, rhs).getResult(); break;
+							    }
+							  } else {
+							    switch (redKind) {
+							    case vector::CombiningKind::MUL: combined = nestedBuilder.create<arith::MulIOp>(nestedLoc, lhs, rhs).getResult(); break;
 							    case vector::CombiningKind::MAXSI: combined = nestedBuilder.create<arith::MaxSIOp>(nestedLoc, lhs, rhs).getResult(); break;
-	    case vector::CombiningKind::MINSI: combined = nestedBuilder.create<arith::MinSIOp>(nestedLoc, lhs, rhs).getResult(); break;
-	    default: combined = nestedBuilder.create<arith::AddIOp>(nestedLoc, lhs, rhs).getResult(); break;
-	    }
-	  }
-	  nestedBuilder.create<scf::ReduceReturnOp>(nestedLoc, combined);
-	}
-      });
+							    case vector::CombiningKind::MINSI: combined = nestedBuilder.create<arith::MinSIOp>(nestedLoc, lhs, rhs).getResult(); break;
+							    default: combined = nestedBuilder.create<arith::AddIOp>(nestedLoc, lhs, rhs).getResult(); break;
+							    }
+							  }
+							  nestedBuilder.create<scf::ReduceReturnOp>(nestedLoc, combined);
+							}
+						      });
       
       // Mark the loop as vectorised so it doesn't get reprocessed
       newLoop->setAttr("vectorized", rewriter.getUnitAttr());
@@ -455,13 +573,13 @@ namespace {
 
       // Do the final reduction
       if (newLoop.getNumResults() > 0) {
-	SmallVector<Value> scalarResults;
-	for (Value vRes : newLoop.getResults()) {
-	  scalarResults.push_back(rewriter.create<vector::ReductionOp>(loc, redKind, vRes));
-	}
-	rewriter.replaceOp(op, scalarResults);
+        SmallVector<Value> scalarResults;
+        for (Value vRes : newLoop.getResults()) {
+          scalarResults.push_back(rewriter.create<vector::ReductionOp>(loc, redKind, vRes));
+        }
+        rewriter.replaceOp(op, scalarResults);
       } else {
-	rewriter.eraseOp(op);
+        rewriter.eraseOp(op);
       }
       
       return success();
@@ -477,11 +595,14 @@ namespace {
 
       int finalWidth = (regBitWidth > 0) ? regBitWidth : 256; 
       int finalUnrollFactor = (unrollFactor > 0) ? unrollFactor : 4;
+      // Added max threads fallback for your tiling pass
+      int maxThreads = 256; 
 
       if (auto attr = module->getAttrOfType<StringAttr>("llvm.target_features")) {
         llvm::StringRef features = attr.getValue();
         if (features.contains("+avx512f")) finalWidth = 512;
         else if (features.contains("+avx2") || features.contains("+avx")) finalWidth = 256;
+        else if (features.contains("+neon") || features.contains("+sse")) finalWidth = 128;
       }
 
       // Move gpu.allocs to memref.allocas
@@ -501,25 +622,17 @@ namespace {
         alloc.erase();
       }
 
-      RewritePatternSet vectorPatterns(ctx);
-      vectorPatterns.add<CUDAToVectorPattern>(ctx, finalWidth, finalUnrollFactor);
-      FrozenRewritePatternSet frozenVectorPatterns(std::move(vectorPatterns));
+      RewritePatternSet patterns(ctx);
+      patterns.add<LaunchToParallelPattern>(ctx);
+      patterns.add<ParallelLoopCollapsePattern>(ctx);
+      patterns.add<BarrierFissionPattern>(ctx);
+      patterns.add<ParallelLoopTilingPattern>(ctx, finalWidth, finalUnrollFactor, maxThreads);
+      patterns.add<CUDAToVectorPattern>(ctx, finalWidth, finalUnrollFactor);
 
-      // Gather loops first to avoid "iterator invalidation" or seeing new loops
-      SmallVector<scf::ParallelOp> leafLoops;
-      module.walk([&](scf::ParallelOp op) {
-        if (!op->hasAttr("vectorized") && !op->hasAttr("tiled")) {
-	  bool hasNested = false;
-	  op.getRegion().walk([&](scf::ParallelOp nested) {
-	    if (nested != op) hasNested = true;
-	  });
-	  if (!hasNested) leafLoops.push_back(op);
-        }
-      });
-
-      for (auto op : leafLoops) {
-        // Wrap the single op in a brace-init list to satisfy the ArrayRef requirement
-        (void)applyOpPatternsAndFold({op.getOperation()}, frozenVectorPatterns);
+      // This allows the LaunchToParallelPattern to generate scf.parallel loops,
+      // and then immediately feeds those new loops into vectoriser, tiling, and fission patterns.
+      if (failed(applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
+	signalPassFailure();
       }
     }
     
