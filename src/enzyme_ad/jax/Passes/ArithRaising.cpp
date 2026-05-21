@@ -91,6 +91,7 @@ struct ArithRaisingPass
     RAISE_BINARY(arith::XOrIOp, stablehlo::XorOp, mhlo::XorOp);
     RAISE_BINARY(math::PowFOp, stablehlo::PowOp, mhlo::PowOp);
     RAISE_BINARY(arith::RemFOp, stablehlo::RemOp, mhlo::RemOp);
+    RAISE_BINARY(arith::RemSIOp, stablehlo::RemOp, mhlo::RemOp);
     RAISE_BINARY(arith::RemUIOp, stablehlo::RemOp, mhlo::RemOp);
 
 #undef RAISE_BINARY
@@ -114,7 +115,10 @@ struct ArithRaisingPass
     RAISE_UNARY(math::SinOp, stablehlo::SineOp, mhlo::SineOp);
     RAISE_UNARY(math::CosOp, stablehlo::CosineOp, mhlo::CosineOp);
     RAISE_UNARY(math::LogOp, stablehlo::LogOp, mhlo::LogOp);
+    RAISE_UNARY(math::Log1pOp, stablehlo::Log1pOp, stablehlo::Log1pOp);
     RAISE_UNARY(math::ExpOp, stablehlo::ExpOp, mhlo::ExpOp);
+    RAISE_UNARY(math::ExpM1Op, stablehlo::Expm1Op, stablehlo::Expm1Op);
+    RAISE_UNARY(math::TanhOp, stablehlo::TanhOp, stablehlo::TanhOp);
     RAISE_UNARY(math::SqrtOp, stablehlo::SqrtOp, mhlo::SqrtOp);
     RAISE_UNARY(math::RsqrtOp, stablehlo::RsqrtOp, mhlo::RsqrtOp);
     RAISE_UNARY(math::CbrtOp, stablehlo::CbrtOp, mhlo::CbrtOp);
@@ -122,7 +126,9 @@ struct ArithRaisingPass
     RAISE_UNARY(math::IsFiniteOp, stablehlo::IsFiniteOp, mhlo::IsFiniteOp);
     RAISE_UNARY(math::CeilOp, stablehlo::CeilOp, mhlo::CeilOp);
     RAISE_UNARY(math::FloorOp, stablehlo::FloorOp, mhlo::FloorOp);
+    RAISE_UNARY(math::ErfOp, chlo::ErfOp, chlo::ErfOp);
     RAISE_UNARY(arith::NegFOp, stablehlo::NegOp, mhlo::NegOp);
+    RAISE_UNARY(enzymexla::LGammaOp, chlo::LgammaOp, chlo::LgammaOp);
 
 #undef RAISE_UNARY
 
@@ -206,6 +212,17 @@ struct ArithRaisingPass
       op.replaceAllUsesWith(res);
       op.erase();
     });
+    op->walk([=](arith::ConvertFOp cvtOp) {
+      auto ty = dyn_cast<RankedTensorType>(cvtOp.getResult().getType());
+      if (!use_stablehlo || !ty)
+        return;
+
+      OpBuilder builder(cvtOp);
+      auto res = stablehlo::ConvertOp::create(builder, cvtOp.getLoc(), ty,
+                                              cvtOp.getIn());
+      cvtOp.replaceAllUsesWith(res.getResult());
+      cvtOp.erase();
+    });
     op->walk([=](arith::TruncFOp truncOp) {
       auto ty = dyn_cast<RankedTensorType>(truncOp.getResult().getType());
       if (!use_stablehlo || !ty)
@@ -218,6 +235,40 @@ struct ArithRaisingPass
       truncOp.erase();
     });
     op->walk([=](arith::ExtFOp truncOp) {
+      auto ty = dyn_cast<RankedTensorType>(truncOp.getResult().getType());
+      if (!use_stablehlo || !ty)
+        return;
+
+      OpBuilder builder(truncOp);
+      auto res = stablehlo::ConvertOp::create(builder, truncOp.getLoc(), ty,
+                                              truncOp.getIn());
+      truncOp.replaceAllUsesWith(res.getResult());
+      truncOp.erase();
+    });
+    // TODO: either SI or UI is wrong
+    op->walk([=](arith::ExtUIOp cvtOp) {
+      auto ty = dyn_cast<RankedTensorType>(cvtOp.getResult().getType());
+      if (!use_stablehlo || !ty)
+        return;
+
+      OpBuilder builder(cvtOp);
+      auto res = stablehlo::ConvertOp::create(builder, cvtOp.getLoc(), ty,
+                                              cvtOp.getIn());
+      cvtOp.replaceAllUsesWith(res.getResult());
+      cvtOp.erase();
+    });
+    op->walk([=](arith::ExtSIOp cvtOp) {
+      auto ty = dyn_cast<RankedTensorType>(cvtOp.getResult().getType());
+      if (!use_stablehlo || !ty)
+        return;
+
+      OpBuilder builder(cvtOp);
+      auto res = stablehlo::ConvertOp::create(builder, cvtOp.getLoc(), ty,
+                                              cvtOp.getIn());
+      cvtOp.replaceAllUsesWith(res.getResult());
+      cvtOp.erase();
+    });
+    op->walk([=](arith::TruncIOp truncOp) {
       auto ty = dyn_cast<RankedTensorType>(truncOp.getResult().getType());
       if (!use_stablehlo || !ty)
         return;
@@ -524,9 +575,27 @@ struct ArithRaisingPass
         default:
           return;
         }
-        newCmpOp = stablehlo::CompareOp::create(
-            builder, cmpOp->getLoc(), cmpOp->getOperand(0),
-            cmpOp->getOperand(1), direction, compType);
+        Value lhs = cmpOp.getOperand(0);
+        Value rhs = cmpOp.getOperand(1);
+        if (compType == stablehlo::ComparisonType::UNSIGNED) {
+          auto lhsType = dyn_cast<RankedTensorType>(lhs.getType());
+          if (lhsType) {
+            auto elemType = lhsType.getElementType();
+            if (elemType.isSignlessInteger() || elemType.isSignedInteger()) {
+              auto unsignedElemType = IntegerType::get(
+                  builder.getContext(), elemType.getIntOrFloatBitWidth(),
+                  IntegerType::Unsigned);
+              auto unsignedType =
+                  RankedTensorType::get(lhsType.getShape(), unsignedElemType);
+              lhs = builder.create<stablehlo::ConvertOp>(cmpOp.getLoc(),
+                                                         unsignedType, lhs);
+              rhs = builder.create<stablehlo::ConvertOp>(cmpOp.getLoc(),
+                                                         unsignedType, rhs);
+            }
+          }
+        }
+        newCmpOp = stablehlo::CompareOp::create(builder, cmpOp->getLoc(), lhs,
+                                                rhs, direction, compType);
       } else {
         return;
       }

@@ -552,7 +552,7 @@ void ParallelLower::runOnOperation() {
     getOperation()->walk(
         [&](mlir::gpu::GridDimOp bidx) { inlineOps.push_back(bidx); });
     getOperation()->walk(
-        [&](mlir::NVVM::Barrier0Op bidx) { inlineOps.push_back(bidx); });
+        [&](mlir::NVVM::BarrierOp bidx) { inlineOps.push_back(bidx); });
 
     SymbolUserMap symbolUserMap(symbolTable, getOperation());
     while (inlineOps.size()) {
@@ -922,7 +922,7 @@ void ParallelLower::runOnOperation() {
       builder.replaceOp(bidx, ValueRange(threadB->getArgument(idx)));
     });
 
-    container.walk([&](mlir::NVVM::Barrier0Op op) {
+    container.walk([&](mlir::NVVM::BarrierOp op) {
       builder.setInsertionPoint(op);
       builder.replaceOpWithNewOp<mlir::enzymexla::BarrierOp>(
           op, threadB->getArguments());
@@ -993,7 +993,12 @@ void ParallelLower::runOnOperation() {
   {
     mlir::RewritePatternSet rpl(getOperation()->getContext());
     GreedyRewriteConfig config;
-    (void)applyPatternsAndFoldGreedily(getOperation(), std::move(rpl), config);
+    config.enableFolding();
+    // We disable region simplification to avoid inadvertently merging
+    // llvm.cond_br now that there is an index type.
+    config.setRegionSimplificationLevel(
+        mlir::GreedySimplifyRegionLevel::Disabled);
+    (void)applyPatternsGreedily(getOperation(), std::move(rpl), config);
   }
 
   {
@@ -1288,7 +1293,8 @@ void ConvertCudaRTtoCPU::runOnOperation() {
   {
     mlir::RewritePatternSet rpl(getOperation()->getContext());
     GreedyRewriteConfig config;
-    (void)applyPatternsAndFoldGreedily(getOperation(), std::move(rpl), config);
+    config.enableFolding();
+    (void)applyPatternsGreedily(getOperation(), std::move(rpl), config);
   }
 }
 #endif
@@ -1391,7 +1397,7 @@ void ConvertCudaRTtoHipRT::runOnOperation() {
     op->erase();
 
   OpBuilder builder(&getContext());
-  getOperation().walk([&](mlir::NVVM::Barrier0Op op) {
+  getOperation().walk([&](mlir::NVVM::BarrierOp op) {
     builder.setInsertionPoint(op);
     mlir::ROCDL::BarrierOp::create(builder, op->getLoc());
     op->erase();

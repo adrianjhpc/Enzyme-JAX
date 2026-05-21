@@ -1228,6 +1228,22 @@ struct WhileToForHelper {
               continue;
             if (ba2.getOwner() != &loop.getBefore().front())
               continue;
+            auto afterYield =
+                cast<scf::YieldOp>(loop.getAfter().front().getTerminator());
+            auto afterValue = afterYield.getOperand(ba2.getArgNumber());
+            auto ba3 = dyn_cast<BlockArgument>(afterValue);
+            if (!ba3) {
+              continue;
+            }
+            if (ba3.getOwner() != &loop.getAfter().front()) {
+              continue;
+            }
+            auto beforeYield = cast<scf::ConditionOp>(
+                loop.getBefore().front().getTerminator());
+            auto inductValue = beforeYield.getArgs()[ba3.getArgNumber()];
+            if (inductValue != steppingVal) {
+              continue;
+            }
             arg = ba2;
           }
         } else {
@@ -1458,6 +1474,7 @@ struct MoveWhileToFor : public OpRewritePattern<WhileOp> {
         legal = true;
         assert(helper.lb);
         assert(helper.ub);
+        break;
       }
       if (!legal) {
         return rewriter.notifyMatchFailure(loop,
@@ -3439,9 +3456,9 @@ void CanonicalizeFor::runOnOperation() {
           MoveSideEffectFreeWhile>(getOperation()->getContext());
   //    WhileLICM,
   GreedyRewriteConfig config;
+  config.enableFolding();
   config.setMaxIterations(247);
-  if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(rpl),
-                                          config))) {
+  if (failed(applyPatternsGreedily(getOperation(), std::move(rpl), config))) {
     signalPassFailure();
   }
 }

@@ -485,7 +485,12 @@ class AutoDiffWhileRev
     : public ReverseAutoDiffOpInterface::ExternalModel<AutoDiffWhileRev,
                                                        WhileOp> {
 
-  enum ReverseMode { CONSTANT, CONSTANT_CHECKPOINTING, UNKNOWN };
+  enum ReverseMode {
+    CONSTANT,
+    CONSTANT_CHECKPOINTING,
+    CONSTANT_BINOMIAL,
+    UNKNOWN
+  };
   struct ReverseModeInfo {
     enum ReverseMode mode = UNKNOWN;
     WhileLoopInfo info;
@@ -1921,7 +1926,7 @@ struct SHLOTransposeOpBatchInterface
     }
     auto cop = mlir::Operation::create(
         src->getLoc(), src->getName(), resultTypes, operands, std::move(attrs),
-        OpaqueProperties(nullptr), mlir::BlockRange(), 0);
+        mlir::PropertyRef(), mlir::BlockRange(), 0);
     builder.insert(cop);
     mapper.map(src->getResult(0), cop->getResult(0));
     return success();

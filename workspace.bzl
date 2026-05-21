@@ -1,20 +1,24 @@
-JAX_COMMIT = "8dac162f0495127e5626d23ee29d8f8e86ded733"
+JAX_COMMIT = "d72694890a8dd1911435edc8f5732af0c58054f5"
 JAX_SHA256 = ""
 
-ENZYME_COMMIT = "fba597f66bdb7ad4478d74432a1150f00692f8ce"
+ENZYME_COMMIT = "d0749cbba68234506c9a953d894650a73114f657"
 ENZYME_SHA256 = ""
 
-ML_TOOLCHAIN_COMMIT = "86d3d02d85f8ad6e3425042c1532a698a6bcbd67"
+ML_TOOLCHAIN_COMMIT = "30ef4a9096f9490e8f198faa5ce5bbddd1b72fdb"
 ML_TOOLCHAIN_SHA256 = ""
 
 # If the empty string this will automatically use the commit above
 # otherwise this should be a path to the folder containing the BUILD file for enzyme
 OVERRIDE_ENZYME_PATH = ""
 
-HEDRON_COMPILE_COMMANDS_COMMIT = "d107d9c9025915902fd52346f1c6e18d87f7013a"
+HEDRON_COMPILE_COMMANDS_COMMIT = "84c8aadfeee9a09105ec22cc85d0f478c90a788a"
 HEDRON_COMPILE_COMMANDS_SHA256 = ""
 
 XLA_PATCHES = [
+    """
+    # Fix support for musl stacktrace issue where execinfo.h is otherwise included
+    sed -i.bak0 "s/defined(__clang__) || defined(__GNUC__)/defined(__GLIBC__)/g" xla/tsl/platform/default/stacktrace.h
+    """,
     """
     sed -i.bak0 "s/\\\"-lamd_comgr\\\",//g" third_party/gpus/rocm/BUILD.tpl 
     """,
@@ -96,7 +100,7 @@ echo "" >> third_party/proto.patch
 echo " #ifndef bswap_16" >> third_party/proto.patch
 echo " static inline uint16_t bswap_16(uint16_t x) {" >> third_party/proto.patch
 sed -i.bak0 "s/protobuf.patch\\"/protobuf.patch\\", \\":proto.patch\\"/g" workspace2.bzl
-sed -i.bak0 "s/= \\[\\"@xla\\/\\/third_party\\/protobuf:protobuf.patch\\"/= \\[\\"@xla\\/\\/third_party\\/protobuf:protobuf.patch\\", \\"\\/\\/third_party:proto.patch\\"/g" third_party/py/python_init_rules.bzl
+sed -i.bak0 "s/\\"@xla\\/\\/third_party\\/protobuf:protobuf.patch\\"/\\"@xla\\/\\/third_party\\/protobuf:protobuf.patch\\", \\"\\/\\/third_party:proto.patch\\"/g" third_party/py/python_init_rules.bzl
 
 """,
     """
@@ -125,6 +129,12 @@ sed -i.bak0 "s/Windows\\.h/windows\\.h/g" xla/tsl/platform/windows/port.cc xla/t
 """,
     """
 sed -i.bak0 "/D_FORTIFY_SOURCE/d" third_party/gpus/crosstool/cc_toolchain_config.bzl.tpl tools/toolchains/cross_compile/cc/BUILD tools/toolchains/clang6/CROSSTOOL.tpl third_party/gpus/crosstool/BUILD.rocm.tpl
+""",
+    """
+sed -i.bak0 "1s|^|load(\\\"@bazel_tools//tools/build_defs/repo:http.bzl\\\", \\\"http_archive\\\")\\n|" workspace3.bzl
+""",
+    """
+sed -i.bak0 '$!N; s|tf_http_archive(\\n\\([ ]*\\)name = "rules_ml_toolchain",|http_archive(\\n\\1name = "rules_ml_toolchain", patch_cmds = [\\\"sed -i.bak0 '/D_FORTIFY_SOURCE/d' cc/features/BUILD gpu/cuda/legacy/crosstool/cc_toolchain_config.bzl.tpl\\\"],|; P; D;' workspace3.bzl
 """,
     """
 sed -i.bak0 "s/i64/LL/g" xla/tsl/platform/windows/env_time.cc
@@ -174,6 +184,13 @@ sed -i.bak0 "s/patch_cmds = \\[/patch_cmds = \\[\\\"find . -type f -name config.
     sed -i.bak0 "s/build_file = \\\"/build_file = \\\"@xla/g" third_party/eigen3/workspace.bzl
 
     sed -i.bak0 "s/urls = /patch_cmds = \\[\\\"sed -i.bak -e 's\\/return PACKET_TYPE(0) == PACKET_TYPE(0);\\/return (PACKET_TYPE)(PACKET_TYPE(0) == PACKET_TYPE(0));\\/g' -e 's\\/return CAST_FROM_INT(CAST_TO_INT(a) == CAST_TO_INT(a));\\/return CAST_FROM_INT((decltype(CAST_TO_INT(a)))(CAST_TO_INT(a) == CAST_TO_INT(a)));\\/' Eigen\\/src\\/Core\\/arch\\/clang\\/PacketMath.h\\\"\\],urls = /g" third_party/eigen3/workspace.bzl
+    """,
+    """
+    sed -i.bak0 's/name = "zstd_compressor",*/name = "zstd_compressor",\\n    linkopts = ["-lm"],/g' xla/tools/BUILD
+    """,
+    """
+    echo '#include <cstdio>' >> xla/tsl/util/filewrapper.cc
+    echo 'namespace std { __attribute__((weak)) void __throw_bad_array_new_length() { fprintf(stderr, "erring in throw_bad_array_new_length\\n"); __builtin_trap(); } }' >> xla/tsl/util/filewrapper.cc
     """,
 ]
 

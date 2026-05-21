@@ -367,6 +367,7 @@ AffineApplyNormalizer::AffineApplyNormalizer(AffineMap map,
           op = nv.getDefiningOp();
         } else {
           operationContext.pop_back();
+          opsTodos.pop_back();
           return nullptr;
         }
         next = op->getNextNode();
@@ -378,6 +379,7 @@ AffineApplyNormalizer::AffineApplyNormalizer(AffineMap map,
         if (index && isAffineForArg(BA)) {
         } else if (!isValidSymbolInt(o, /*recur*/ false, scope)) {
           operationContext.pop_back();
+          opsTodos.pop_back();
           return nullptr;
         }
         next = &BA.getOwner()->front();
@@ -2658,7 +2660,7 @@ struct ForOpRaising : public OpRewritePattern<scf::ForOp> {
 
       affine::AffineForOp affineLoop = affine::AffineForOp::create(
           rewriter, loop.getLoc(), lbs, lbMap, ubs, ubMap,
-          getStep(loop.getStep()), loop.getInits());
+          rewrittenStep ? 1 : getStep(loop.getStep()), loop.getInits());
       preserveDiscardableAttributes(affineLoop, loop);
 
       auto mergedYieldOp =
@@ -6037,8 +6039,8 @@ void AffineCFGPass::runOnOperation() {
   IslAnalysis islAnalysis;
   populateAffineExprSimplificationPatterns(islAnalysis, rpl);
   GreedyRewriteConfig config;
-  if (failed(applyPatternsAndFoldGreedily(getOperation(), std::move(rpl),
-                                          config))) {
+  config.enableFolding();
+  if (failed(applyPatternsGreedily(getOperation(), std::move(rpl), config))) {
     signalPassFailure();
   }
 }
@@ -6645,7 +6647,8 @@ static bool isLoopMemoryLockStepExecutable(AffineForOp forOp) {
       // Filter out stores the same way as above.
       if (!isLocallyDefined(writeOp.getMemRef(), forOp))
         loadAndStoreOps.push_back(op);
-    } else if (!isa<AffineForOp, AffineYieldOp, AffineIfOp>(op) &&
+    } else if (!isa<AffineForOp, AffineYieldOp, AffineIfOp, scf::IfOp,
+                    scf::YieldOp>(op) &&
                !isReadNone(op)) {
       return WalkResult::interrupt();
     }
