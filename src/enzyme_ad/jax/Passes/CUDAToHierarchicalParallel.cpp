@@ -631,7 +631,7 @@ namespace {
 
       // This allows the LaunchToParallelPattern to generate scf.parallel loops,
       // and then immediately feeds those new loops into vectoriser, tiling, and fission patterns.
-      if (failed(applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
+      if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
 	signalPassFailure();
       }
     }
